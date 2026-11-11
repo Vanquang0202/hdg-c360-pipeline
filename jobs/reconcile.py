@@ -1,3 +1,6 @@
+# Mục đích: Đối soát toàn dòng giữa Oracle và Stage/Mirror/Recovery Candidate.
+# Đầu vào: run_id, tầng đích và SCN của snapshot; có thể yêu cầu ghi lại audit Stage.
+# Đầu ra: Log số dòng/nội dung khớp; chỉ ghi digest khi cả bốn bảng khớp snapshot.
 """Compare raw Oracle snapshot values with staging/Mirror; optionally re-audit retained stage."""
 import argparse
 import re
@@ -10,6 +13,7 @@ from schema_preflight import assert_source_schema
 
 
 def main():
+    # BƯỚC 1: Chọn run_id, snapshot và tầng đích; ghi audit chỉ hợp lệ với Stage tại snapshot.
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-id",required=True)
     parser.add_argument("--target",choices=("stage","mirror","candidate"),default="mirror")
@@ -30,6 +34,7 @@ def main():
     config,schema=settings(),source_schema()
     spark=create_spark("HDG reconcile")
     try:
+        # BƯỚC 2: Kiểm nguồn và chốt SCN; cả chế độ current cũng phải dùng một ảnh chung.
         with jdbc_connection(spark,config,"oracle") as oracle:
             assert_source_schema(oracle,schema)
             current_scn=(int(scalar(oracle,"SELECT DBMS_FLASHBACK.GET_SYSTEM_CHANGE_NUMBER FROM DUAL"))
@@ -45,10 +50,12 @@ def main():
                 if scalar(connection,"SELECT CASE WHEN pg_try_advisory_xact_lock(784027,1) THEN 'locked' ELSE 'busy' END")!="locked":
                     raise RuntimeError("A Full Load/recovery is active")
             # Keep all target tables stable while Spark performs multiple JDBC actions.
+            # BƯỚC 3: SHARE lock giữ đích đứng yên trong các lần đọc JDBC; có thể chặn writer nên cần cửa sổ phù hợp.
             target_namespace="hdg_stage" if args.target=="stage" else namespace
             for table in schema.values():
                 execute(connection,f"LOCK TABLE {target_namespace}.{table['mirror']} IN SHARE MODE")
             comparison_scn=int(scn) if args.source=="snapshot" else current_scn
+            # BƯỚC 4: So hai chiều toàn bộ dữ liệu từng bảng; COUNT bằng nhau vẫn có thể mất chuỗi.
             results=[]
             for source,table in schema.items():
                 started=time.monotonic()
@@ -61,6 +68,7 @@ def main():
                     elapsed_seconds=round(time.monotonic()-started,3),**result)
             if not all(result["equal"] for _,_,result in results):
                 raise RuntimeError("Counts or full-row multisets differ; no audit updated")
+            # BƯỚC 5: Chỉ ký digest Stage sau khi cả bốn bảng khớp đúng snapshot; giữ trạng thái lịch sử run.
             if args.record_stage_audit:
                 for source,table,result in results:
                     updated=execute(connection,

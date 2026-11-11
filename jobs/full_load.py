@@ -1,3 +1,6 @@
+# Mục đích: Điểm xử lý Full Load: Oracle → Spark JDBC → Staging → đối soát → publish có điều kiện.
+# Đầu vào: Cấu hình jobs/.env hoặc môi trường, SCN tùy chọn và --stage-only.
+# Đầu ra: Staging theo run_id, audit và trạng thái; chỉ publish khi mọi bảo vệ đều đạt.
 """Full Load Oracle -> Spark JDBC -> PostgreSQL staging -> validation -> publish."""
 
 import argparse
@@ -14,6 +17,7 @@ from schema_preflight import assert_source_schema
 
 
 def main():
+    # BƯỚC 1: Đọc tham số và cấu hình; --stage-only chỉ nạp Stage, không cho phép ghi Mirror.
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--batch-size", type=int, default=1000)
     parser.add_argument("--source-scn", type=int, help="Use an operator-supplied Oracle snapshot SCN")
@@ -24,12 +28,14 @@ def main():
         parser.error("--batch-size must be between 1 and 10000")
     if args.source_scn is not None and args.source_scn < 1:
         parser.error("--source-scn must be positive")
+    # BƯỚC 2: Đọc cùng contract 132 cột để Spark, Stage và SQL publish không lệch mapping.
     config, schema = settings(), source_schema()
     spark = create_spark("HDG full load")
     run_id, phase = str(uuid.uuid4()), "preflight"
     started = time.monotonic()
     try:
         with jdbc_connection(spark, config, "pg") as control:
+            # BƯỚC 3: Khóa một lượt Full Load; kiểm schema/metadata trước khi tạo run mới.
             lock = scalar(control,
                           "SELECT CASE WHEN pg_try_advisory_lock(784027,1) "
                           "THEN 'locked' ELSE 'busy' END")
@@ -42,6 +48,7 @@ def main():
                 raise RuntimeError("CDC is enabled. Snapshot/CDC handoff must be implemented separately.")
             with jdbc_connection(spark, config, "oracle") as oracle:
                 assert_source_schema(oracle, schema)
+            # BƯỚC 4: Chốt một SCN cho cả bốn bảng; SCN là ảnh nhất quán, không phải Kafka offset.
             if args.source_scn is None:
                 with jdbc_connection(spark, config, "oracle") as oracle:
                     scn = int(scalar(oracle, "SELECT DBMS_FLASHBACK.GET_SYSTEM_CHANGE_NUMBER FROM DUAL"))
@@ -57,6 +64,7 @@ def main():
                 for source, table in schema.items():
                     phase = source
                     table_started = time.monotonic()
+                    # BƯỚC 5: Đọc snapshot qua Spark JDBC và ghi giá trị nguyên vẹn vào Stage theo run_id.
                     source_frame = read_source(spark, config, source, table, scn)
                     source_rows = source_frame.count()
                     (
@@ -72,6 +80,7 @@ def main():
                         .option("queryTimeout", "300")
                         .mode("append").save()
                     )
+                    # BƯỚC 6: So đủ cột và số lần lặp với nguồn, rồi ghi audit/digest theo khả năng metadata.
                     stage_frame = read_target(spark, config, table, run_id, "stage")
                     result = reconcile_frames(source_frame, stage_frame, table)
                     if source_rows != result["source_rows"] or not result["equal"]:
@@ -88,15 +97,18 @@ def main():
                 phase = "finalize_stage" if args.stage_only else "publish"
                 execute(control, "UPDATE hdg_load.runs SET status='VALIDATED' WHERE run_id=?", (run_id,))
                 control.commit()
+                # BƯỚC 7: Stage-only kết thúc ở đây; VALIDATED chưa có nghĩa Mirror hoặc CDC đã an toàn.
                 if args.stage_only:
                     log("run_staged", run_id=run_id, source_scn=scn, outcome="STAGED", audit_mode=audit_mode,
                         elapsed_seconds=round(time.monotonic() - started, 3))
                     return
+                # BƯỚC 8: Publisher chỉ nạp lần đầu vào Mirror rỗng hoặc xác nhận NOOP nếu toàn dòng bằng nhau.
                 outcome = scalar(control, "SELECT hdg_load.publish_full_load(?)", (run_id,))
                 control.commit()
                 log("run_finished", run_id=run_id, outcome=outcome,
                     elapsed_seconds=round(time.monotonic() - started, 3))
             except Exception:
+                # Khi lỗi, rollback; không ghi FAILED đè COMMITTED/NOOP nếu phản hồi commit đã bị mất.
                 control.rollback()
                 # Preserve COMMITTED/NOOP if a commit reply was lost. Inspect
                 # runs after reconnecting before deciding to run again.

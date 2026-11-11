@@ -1,3 +1,6 @@
+# Mục đích: Chạy một job PySpark bằng Python 3.11 và classpath JDBC local.
+# Đầu vào: -Job full_load/reconcile/check_jdbc, đường dẫn Python/JAR và JobArguments.
+# Đầu ra: Tiến trình Spark local[2] cùng mã thoát của job; không tự chạy DDL.
 param(
     [Parameter(Mandatory = $true)]
     [ValidateSet("full_load", "reconcile", "check_jdbc")]
@@ -10,6 +13,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+# BƯỚC 1: Kiểm file và phiên bản PySpark trước khi khởi động JVM.
 foreach ($file in @($Python, $OracleJar, $PostgresJar)) {
     if (-not (Test-Path -LiteralPath $file -PathType Leaf)) {
         throw "Required file is missing: $file. See jobs/FULL_LOAD.md."
@@ -27,11 +31,13 @@ if ($LASTEXITCODE -ne 0 -or $sparkVersion.Trim() -ne "4.0.1") {
 $sparkHome = & $Python -c "from pathlib import Path; import pyspark; print(Path(pyspark.__file__).parent)"
 if ($LASTEXITCODE -ne 0) { throw "Cannot locate the PySpark distribution." }
 
+# BƯỚC 2: Cố định Python/Spark cho driver và worker để không dùng nhầm venv cũ.
 $env:SPARK_HOME = $sparkHome.Trim()
 $env:PYSPARK_PYTHON = $Python
 $env:PYSPARK_DRIVER_PYTHON = $Python
 
 $submit = Join-Path $env:SPARK_HOME "bin\spark-submit.cmd"
+# BƯỚC 3: Hai JAR cùng ở máy local; classpath tránh phân phối file thừa qua Hadoop fetchFile.
 $classPath = @($OracleJar, $PostgresJar) -join [IO.Path]::PathSeparator
 $sparkArgs = @(
     "--master", "local[2]",
@@ -45,5 +51,8 @@ $sparkArgs = @(
     "--conf", "spark.task.maxFailures=1",
     "--conf", "spark.speculation=false"
 )
-& $submit @sparkArgs (Join-Path $PSScriptRoot "$Job.py") @JobArguments
+# BƯỚC 4: Chuyển nguyên tham số cho job đã chọn; full_load.py mới quyết định Stage/publish.
+# Kiểm JDBC nằm trong tests; hai job xử lý dữ liệu vẫn nằm trong jobs.
+$jobFile = if ($Job -eq "check_jdbc") { Join-Path $PSScriptRoot "..\tests\full_load\check_jdbc.py" } else { Join-Path $PSScriptRoot "$Job.py" }
+& $submit @sparkArgs $jobFile @JobArguments
 exit $LASTEXITCODE

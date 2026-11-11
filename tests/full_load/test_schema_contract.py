@@ -1,4 +1,10 @@
+# Mục đích: Bảo vệ mapping và SQL sinh ra khỏi lỗi cắt chuỗi/lệch schema.
+# Đầu vào: DDL và source hiện có, metadata giả lập.
+# Đầu ra: Kết quả unit test offline; không kết nối Oracle/PostgreSQL.
 """Offline schema/SQL regression tests. Never imports JDBC drivers or connects to a database."""
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "jobs"))
 import re
 import unittest
 from unittest.mock import patch
@@ -9,6 +15,7 @@ from pathlib import Path
 
 
 class ContractTests(unittest.TestCase):
+    # Giữ các ca mapping/typmod/SQL sinh ra để ngăn tái diễn mất dữ liệu.
     def test_all_132_columns_have_independent_type_lengths(self):
         schema=source_schema()
         self.assertEqual([len(t["columns"]) for t in schema.values()],[111,6,3,12])

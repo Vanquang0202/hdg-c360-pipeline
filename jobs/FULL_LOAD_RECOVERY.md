@@ -147,9 +147,9 @@ Bộ sửa này cố ý không có hàm restore trực tiếp hoặc reset boots
 ## 6. Kiểm thử và tiêu chí đạt
 
 ```powershell
-& C:\Python311\python.exe -B jobs/test_schema_contract.py
+& C:\Python311\python.exe -B tests/full_load/test_schema_contract.py
 & C:\Python311\python.exe -B jobs/build_full_load_sql.py --check
-& C:\Python311\python.exe -B jobs/test_spark_transport.py
+& C:\Python311\python.exe -B tests/full_load/test_spark_transport.py
 # Chỉ chạy integration sau khi tự tạo database test riêng, rỗng:
 psql -h localhost -p 55432 -U $env:PG_USER -d hdg_full_load_test -v ON_ERROR_STOP=1 -f tests/full_load/integration.sql
 ```

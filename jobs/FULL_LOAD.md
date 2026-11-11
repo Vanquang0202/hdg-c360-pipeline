@@ -8,7 +8,7 @@ Launcher mặc định dùng `C:\Python311\python.exe` với PySpark 4.0.1 đã 
 
 Job chạy local[2], từng bảng nối JDBC với một partition đọc và một partition ghi. Không dùng partitionColumn, lowerBound/upperBound cho MA_CD dạng VARCHAR2. Toàn bộ dữ liệu đi qua Spark DataFrame và Spark JDBC. Các lệnh điều khiển transaction, metadata và publish đi qua JDBC của JVM.
 
-Các file phục vụ lần triển khai này gồm spark_common.py, full_load.py, reconcile.py, run_spark.ps1, check_jdbc.py, test_spark_transport.py, requirements-spark.txt, .env.example và hai file SQL trong sql/postgres.
+Các file phục vụ lần triển khai này gồm spark_common.py, full_load.py, reconcile.py, run_spark.ps1, tests/full_load/check_jdbc.py, tests/full_load/test_spark_transport.py, requirements-spark.txt, .env.example và hai file SQL trong sql/postgres.
 
 ## 2. JDBC Driver và cấu hình
 
@@ -52,7 +52,7 @@ Có thể dùng jobs/.env theo mẫu jobs/.env.example. Biến môi trường đ
 Có thể kiểm tra phép so số chính xác và đối soát dòng trùng bằng bộ test Spark cục bộ. Test tạo DataFrame nhỏ trong bộ nhớ và chỉ chạy khi gọi lệnh dưới đây.
 
 ```powershell
-& "C:\Python311\python.exe" jobs/test_spark_transport.py
+& "C:\Python311\python.exe" tests/full_load/test_spark_transport.py
 ```
 
 ### Kiểm tra khởi động và JDBC trước khi kết nối database
@@ -231,8 +231,8 @@ VALIDATED chỉ xác nhận đối soát nguồn/staging tại thời điểm ch
 Kiểm thử cho lần sửa preflight:
 
 ```powershell
-& C:\Python311\python.exe -B jobs/test_stage_only.py
-& C:\Python311\python.exe -B jobs/test_schema_contract.py
+& C:\Python311\python.exe -B tests/full_load/test_stage_only.py
+& C:\Python311\python.exe -B tests/full_load/test_schema_contract.py
 & C:\Python311\python.exe -B jobs/build_full_load_sql.py --check
 ```
 

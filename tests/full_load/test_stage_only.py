@@ -1,4 +1,10 @@
+# Mục đích: Bảo vệ nhánh stage-only trên catalog cũ và v2.
+# Đầu vào: Catalog, Spark và JDBC giả lập; dùng hợp đồng 132 cột thật.
+# Đầu ra: Kết quả regression test, không nạp staging hay publish thực tế.
 """Offline regressions with legacy/v2 catalog fixtures and mocked Spark/JDBC actions."""
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "jobs"))
 import sys
 import types
 import unittest
@@ -6,7 +12,7 @@ from contextlib import contextmanager
 from unittest.mock import MagicMock, Mock, patch
 from schema_contract import source_schema, pg_catalog_type
 from schema_preflight import assert_pg_schema
-from staging_metadata import RUN_COLUMNS, TABLE_RUN_COLUMNS, DIGEST_COLUMN
+from schema_preflight import RUN_COLUMNS, TABLE_RUN_COLUMNS, DIGEST_COLUMN
 import full_load
 import spark_common
 
@@ -63,6 +69,7 @@ class Catalog:
 
 
 class StageOnlyTests(unittest.TestCase):
+    # Kiểm nhánh legacy/v2 bằng mock, gồm cả lỗi xảy ra trước khi ghi metadata.
     def test_legacy_staging_does_not_probe_publisher_or_mirror(self):
         catalog=Catalog()
         self.assertEqual(catalog.preflight(include_mirror=False),{"stage_digest":False})

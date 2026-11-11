@@ -1,3 +1,6 @@
+# Mục đích: Đọc DDL Oracle thành hợp đồng kiểu dữ liệu dùng chung cho Full Load và Sink.
+# Đầu vào: DDL nguồn nguyên bản, không tự thêm cột hoặc giả định khóa.
+# Đầu ra: Đủ 132 cột cùng độ dài, BYTE/CHAR, precision/scale, NULL và PK đã khai báo.
 """Strict Oracle DDL contract; shared by runtime checks and SQL generation."""
 import re
 from pathlib import Path
@@ -13,6 +16,7 @@ EXPECTED_COLUMNS = (111, 6, 3, 12)
 
 
 def parse_type(value):
+    # BƯỚC 1: Lấy độ dài trong ngoặc VARCHAR2(n), không lấy chữ số 2 trong tên kiểu; chặn kiểu chưa hỗ trợ.
     value = value.upper().strip()
     char = re.fullmatch(r"(VARCHAR2|NVARCHAR2|CHAR)\(\s*(\d+)\s*(BYTE|CHAR)?\s*\)", value)
     if char:
@@ -41,6 +45,7 @@ def parse_type(value):
 
 
 def source_schema(ddl=None):
+    # BƯỚC 2: Đọc đúng bốn bảng/132 cột và ràng buộc có trong DDL; không suy diễn ID là PK.
     if ddl is None:
         ddl = (ROOT / "sql/oracle/01_create_source_tables.sql").read_text(encoding="utf-8")
     result = {}
@@ -82,6 +87,7 @@ def byte_constraint(table, column):
 
 
 def checked_expression(column):
+    # BƯỚC 3: Sinh lời gọi guard theo kiểu cột để publisher kiểm khả năng lưu trước khi gán kiểu đích.
     name = column["name"]
     if column["family"] == "string":
         return f"hdg_load.checked_text({name}, {column['length']}, {str(column['unit'] == 'BYTE').lower()})"

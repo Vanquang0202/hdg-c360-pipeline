@@ -1,3 +1,6 @@
+# Mục đích: Điểm bắt đầu CDC Sink prototype: tạo fixture, init baseline hoặc replay.
+# Đầu vào: Manifest cùng JSONL/range Kafka hữu hạn; đích DB test được cố định.
+# Đầu ra: Kết quả từng frame; không suy baseline từ offset 0/latest và không thực hiện cutover.
 """CLI for a fixed PostgreSQL test target and explicit finite test manifests."""
 import argparse
 import json
@@ -6,12 +9,13 @@ from pathlib import Path
 import psycopg
 from contract import DATABASE, PORT
 from protocol import loads, Record, Rejected
-from manifest import load, check_records
+from engine import load, check_records
 from storage import connect_test, bootstrap, reset_test_fixture
 from engine import initialize, apply_frame
 
 
 def replay(document,records,connection,retries=2):
+    # BƯỚC 3: Áp lần lượt frame đã biết thứ tự; retry nguyên frame sau reconnect, không tự tiến offset khi lỗi.
     found=check_records(document,records)
     outcomes=[]
     original=connection
@@ -39,6 +43,7 @@ def replay(document,records,connection,retries=2):
 
 
 def main():
+    # BƯỚC 1: Chọn lệnh và manifest; kiểm baseline/range trước khi mở PostgreSQL test.
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command",choices=("generate-fixture","init","replay","reset-test"))
     parser.add_argument("--confirm-test-db")
@@ -66,6 +71,7 @@ def main():
             reset_test_fixture(connection)
         print("Reset prototype test fixtures only; test schema/guard retained")
         return
+    # BƯỚC 2: Bắt buộc baseline/offset tường minh trước init/replay; không đoán từ dữ liệu đang có.
     if args.manifest is None:
         parser.error("--manifest is mandatory; no offset/baseline default exists")
     document=load(args.manifest)
@@ -80,6 +86,8 @@ def main():
             from kafka_reader import read_ranges
             records=read_ranges(document,args.kafka_bootstrap)
         check_records(document,records)
+    # BƯỚC 4: Chỉ vào DB test cố định; init nạp baseline, replay áp các frame đã kiểm tra.
+
     with connect_test() as connection:
         if args.command=="init":
             bootstrap(connection)

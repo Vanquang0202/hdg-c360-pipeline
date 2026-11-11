@@ -1,3 +1,6 @@
+# Mục đích: Đọc đúng các range Kafka đã khai báo để replay vào DB test.
+# Đầu vào: Bootstrap server và manifest đã xác minh baseline/topic ID/start/end.
+# Đầu ra: Raw record hữu hạn; chỉ đọc Kafka, không commit/reset offset hay tạo topic.
 """Bounded, read-only Kafka reader. Never commits/resets group or Source offsets."""
 import time
 import uuid
@@ -7,6 +10,7 @@ from protocol import Record, Rejected
 
 
 def read_ranges(document, bootstrap, timeout=30):
+    # BƯỚC 1: Kiểm topic ID/watermark, assign đúng start rồi đọc tới end; Kafka offset được giữ nguyên.
     streams=[s for s in document["streams"] if s["start"]<s["end"]]
     if not streams:
         return []
@@ -31,6 +35,7 @@ def read_ranges(document, bootstrap, timeout=30):
             s=specs[(tp.topic,tp.partition)]
             if low>s["start"] or high<s["end"]:
                 raise Rejected("KAFKA_RANGE_UNAVAILABLE")
+        # BƯỚC 2: Đọc đúng [start,end) do manifest chọn, không subscribe/commit group hoặc chọn latest.
         consumer.assign(assigned)
         expected=sum(s["end"]-s["start"] for s in streams)
         while len(records)<expected:
@@ -57,4 +62,5 @@ def read_ranges(document, bootstrap, timeout=30):
         return list(records.values())
     finally:
         # assign(), not subscribe(); no offset commit and no production group membership.
+        # BƯỚC 3: Đóng reader; Kafka offsets vẫn không bị ghi lại bởi prototype.
         consumer.close()

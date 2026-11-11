@@ -1,3 +1,8 @@
+-- Mục đích: khảo sát điều kiện LogMiner trước khi triển khai, không tự bật logging.
+-- Đầu vào: phiên SQLPlus SYSDBA của Oracle local.
+-- Đầu ra: thông tin CDB/PDB, redo/archive, giao dịch và khóa; ALTER SESSION chỉ đổi container của phiên.
+-- BƯỚC 1: Kiểm database và nhật ký ở root; 2314948 phía dưới là mốc khảo sát cũ, không phải barrier mới.
+-- BƯỚC 2: Chuyển sang PDB để xem logging/constraint của VSS; không thay dữ liệu nguồn.
 -- Read-only checks; run manually as SYSDBA. No ALTER SYSTEM or log switching.
 SET LINESIZE 220
 SET PAGESIZE 100

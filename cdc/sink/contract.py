@@ -1,3 +1,6 @@
+# Mục đích: Tái sử dụng mapping v2 và cố định phạm vi PostgreSQL test cho Sink.
+# Đầu vào: schema_contract.py và byte gốc của DDL Oracle.
+# Đầu ra: TABLES, CONTRACT_HASH, database/port/schema test; không trỏ Mirror live.
 """Read-only reuse of the Full Load v2 Oracle contract."""
 import hashlib
 import sys

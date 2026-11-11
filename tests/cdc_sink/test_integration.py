@@ -1,3 +1,6 @@
+# Mục đích: Kiểm tính nguyên tử/replay trên database test cố định cổng 55433.
+# Đầu vào: PostgreSQL test và synthetic events, không phải Mirror live.
+# Đầu ra: Kết quả integration; mỗi ca chỉ reset các bảng fixture riêng của prototype.
 """Real PostgreSQL integration suite. Fixed separate container/database/port only."""
 import json
 import os
@@ -11,18 +14,19 @@ from decimal import Decimal
 from pathlib import Path
 from psycopg import sql
 
-HERE=Path(__file__).resolve().parents[1]
+HERE=Path(__file__).resolve().parents[2] / "cdc/sink"
 sys.path.insert(0,str(HERE))
 from contract import TABLES, DATABASE
 from protocol import Rejected, loads
 from fixtures import Builder, image
-from manifest import validate, check_records
+from engine import validate, check_records
 from storage import connect_test, bootstrap, assert_target, relation, reset_test_fixture
 from engine import initialize, apply_frame, SimulatedCrash
 
 
 class PostgresTests(unittest.TestCase):
     @classmethod
+    # Chỉ chạy integration khi được phép reset fixture trong DB test; không dùng làm lệnh chạy hàng ngày.
     def setUpClass(cls):
         with connect_test() as connection:
             bootstrap(connection)
@@ -281,7 +285,7 @@ class PostgresTests(unittest.TestCase):
         manifest=directory/"manifest.json"; records=directory/"records.jsonl"
         manifest.write_text(json.dumps(self.doc),encoding="utf-8")
         records.write_text("\n".join(json.dumps(r.wire()) for r in b.records),encoding="utf-8")
-        result=subprocess.run([sys.executable,"-B",str(HERE/"tests/crash_worker.py"),
+        result=subprocess.run([sys.executable,"-B",str(Path(__file__).resolve().parent/"crash_worker.py"),
                                str(manifest),str(records),phase],capture_output=True,text=True,timeout=30)
         self.assertEqual(result.returncode,expected_exit,result.stderr)
         return b

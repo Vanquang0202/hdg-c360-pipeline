@@ -1,3 +1,6 @@
+# Mục đích: Bảo vệ decoder, baseline, guard đích và Kafka reader không ghi offset.
+# Đầu vào: Fixture và mock, không cần DB/Kafka đang chạy.
+# Đầu ra: Kết quả unit test; Setup-Test.ps1 và lệnh unittest vẫn dùng file này.
 import copy
 import json
 import sys
@@ -9,13 +12,14 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
+# Nạp module runtime ở vị trí gốc; test không chứa bản sao code Sink.
+sys.path.insert(0,str(Path(__file__).resolve().parents[2] / "cdc/sink"))
 from contract import TABLES
 from schema_contract import parse_type
 from protocol import (decode, row, value, descriptors, Rejected, loads, exact_decimal,
                       canonical, EPOCH, Record)
 from fixtures import Builder, image, row_schema, encoded_row, field, binary_integer
-from manifest import validate, check_records
+from engine import validate, check_records
 from storage import bootstrap, assert_endpoint
 from engine import transaction
 
@@ -25,6 +29,7 @@ def number_column(oracle="NUMBER"):
 
 
 class ProtocolTests(unittest.TestCase):
+    # Kiểm decoder, replay, guard và Kafka reader giả lập; không cần kết nối hệ thống.
     def test_all_132_contract_columns_and_full_schemas(self):
         self.assertEqual(sum(len(t["columns"]) for t in TABLES.values()),132)
         for source,table in TABLES.items():

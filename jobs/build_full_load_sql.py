@@ -1,3 +1,6 @@
+# Mục đích: Sinh bốn file SQL PostgreSQL từ cùng một hợp đồng Oracle.
+# Đầu vào: schema_contract.py, template full_load_guards.sql và phần metadata DDL hiện có.
+# Đầu ra: DDL/publisher/migration/candidate SQL; --check chỉ đối chiếu file, không kết nối DB.
 """Generate PostgreSQL assets from the strict Oracle contract. Never connects to a database."""
 import argparse
 from pathlib import Path
@@ -120,7 +123,8 @@ def locks():
 
 
 def publish_sql():
-    sql = HEADER+"BEGIN;\n"+(ROOT/"jobs/full_load_guards.sql").read_text(encoding="utf-8")
+    # Sinh publisher có khóa, guard, digest và so toàn dòng; không thực hiện SQL tại đây.
+    sql = HEADER+"BEGIN;\n-- Mục đích: cài guard, digest, kiểm schema và publisher Full Load có bảo vệ.\n-- Đầu vào: Stage/run đã đối soát; đầu ra: hàm trả COMMITTED hoặc NOOP, còn lệch thì lỗi.\n"+(ROOT/"jobs/full_load_guards.sql").read_text(encoding="utf-8")
     sql += digest_sql()+assertion_sql()
     sql += """
 CREATE OR REPLACE FUNCTION hdg_load.contract_version() RETURNS integer
@@ -130,6 +134,7 @@ RETURNS text LANGUAGE plpgsql SET search_path=pg_catalog AS $publish$
 DECLARE state hdg_load.control%ROWTYPE; run_status text;
     expected_count bigint; actual_count bigint; expected_digest text; copied boolean:=false;
 BEGIN
+    -- BƯỚC 1: Khóa control và chặn publish khi CDC đang giữ trách nhiệm cập nhật.
     PERFORM pg_advisory_xact_lock(784027,2);
     SELECT * INTO STRICT state FROM hdg_load.control WHERE id=1 FOR UPDATE;
     IF state.cdc_enabled THEN RAISE EXCEPTION 'CDC enabled; separately verified handoff required'; END IF;
@@ -139,7 +144,7 @@ BEGIN
         RAISE EXCEPTION 'Four validated table audits required';
     END IF;
 """ + locks() + "    PERFORM hdg_load.assert_mirror_schema();\n" + stage_validation()
-    sql += "    IF NOT state.bootstrap_published THEN\n"
+    sql += "    -- BƯỚC 2: Sau kiểm schema/digest, chỉ nạp bootstrap vào cả bốn Mirror rỗng.\n    IF NOT state.bootstrap_published THEN\n"
     for t in SCHEMA.values():
         sql += f"        IF EXISTS(SELECT 1 FROM public.{t['mirror']}) THEN RAISE EXCEPTION 'Initial publish requires empty Mirror'; END IF;\n"
     for t in SCHEMA.values():
@@ -148,6 +153,7 @@ BEGIN
     for t in SCHEMA.values():
         sql += f"    IF EXISTS({difference(t)}) THEN RAISE EXCEPTION 'Mirror content differs for {t['mirror']}; publish refused'; END IF;\n"
     return sql+"""
+    -- BƯỚC 3: Chỉ sau khi toàn dòng bằng nhau mới xác nhận kết quả; NOOP giữ nguyên dữ liệu.
     UPDATE hdg_load.control SET bootstrap_published=true,
       last_run_id=CASE WHEN copied THEN p_run_id ELSE last_run_id END WHERE id=1;
     UPDATE hdg_load.runs SET status=CASE WHEN copied THEN 'COMMITTED' ELSE 'NOOP' END,
@@ -160,6 +166,7 @@ COMMIT;
 
 def ddl_sql():
     # Control metadata is stable; keep original preamble when regenerating.
+    # Sinh Mirror đúng kiểu và Stage text theo cùng hợp đồng; giữ phần metadata đầu file hiện có.
     old=(ROOT/"sql/postgres/01_create_mirror_tables.sql").read_text(encoding="utf-8")
     prefix=old[:old.index("CREATE TABLE public.mirror_hdg_nhankhau")]
     if "stage_digest" not in prefix:
@@ -184,7 +191,12 @@ def ddl_sql():
 
 
 def migration_sql():
-    sql=HEADER+"""-- Schema only: does not restore previously truncated values.
+    # Sinh migration có kiểm tra trước khi đổi kiểu; mở rộng cột không phục hồi chuỗi đã mất.
+    sql=HEADER+"""-- Mục đích: sửa kiểu/constraint và thay publisher trong cùng một transaction.
+-- Đầu vào: schema hiện có; đầu ra: contract v2, không tự phục hồi chuỗi đã mất.
+-- BƯỚC 1: Lấy khóa, kiểm mọi giá trị trước khi đổi kiểu để tránh mất thông tin.
+-- BƯỚC 2: Cập nhật constraint/audit và cài cùng bộ hàm publish, rồi kiểm schema trước commit.
+-- Schema only: does not restore previously truncated values.
 -- Stop/quiesce all Mirror writers first; do not infer this from cdc_enabled alone.
 BEGIN;
 SET LOCAL lock_timeout='10s';
@@ -229,7 +241,13 @@ ALTER TABLE public.{t['mirror']} ALTER COLUMN {n} {"SET" if c["required"] else "
 
 
 def recovery_sql():
-    sql=HEADER+"""-- Builds an isolated candidate only. No live Mirror/control/run status changes.
+    # Sinh hàm dựng candidate riêng, không sinh thao tác ghi đè Mirror live.
+    sql=HEADER+"""-- Mục đích: cài hàm dựng candidate cách ly từ Stage đã có audit.
+-- Đầu vào: run_id, SCN mong đợi và tên schema hdg_recovery_* mới.
+-- Đầu ra: bốn bảng candidate và kiểm toàn dòng; không tự chuyển dữ liệu sang live.
+-- BƯỚC 1: Kiểm schema/SCN, giữ Stage ổn định và xác minh digest.
+-- BƯỚC 2: Tạo đủ bốn bảng trong schema mới, đối soát hai chiều rồi kết thúc.
+-- Builds an isolated candidate only. No live Mirror/control/run status changes.
 BEGIN;
 CREATE OR REPLACE FUNCTION hdg_load.build_recovery_candidate(p_run_id varchar,p_expected_scn numeric,p_schema text)
 RETURNS void LANGUAGE plpgsql SET search_path=pg_catalog AS $f$
@@ -266,6 +284,7 @@ def generated_files():
 
 
 def main():
+    # BƯỚC 1: Dựng nội dung SQL từ contract; --check chỉ so sánh, bỏ --check mới ghi lại các file SQL.
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check",action="store_true",help="Check generated assets without writing")
     args=parser.parse_args()

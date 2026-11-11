@@ -1,3 +1,8 @@
+-- Mục đích: template tạo common user LogMiner và quyền đọc bốn bảng VSS.
+-- Đầu vào: SYSDBA và placeholder mật khẩu được Invoke-OracleSetup.ps1 điền trong bộ nhớ.
+-- Đầu ra: user/quyền khi chạy thủ công; không chạy lại chỉ vì Source đã RUNNING.
+-- BƯỚC 1: Chặn lỗi SQL và thay thế biến SQLPlus; tạo user ở root, không ghi đè user có sẵn.
+-- BƯỚC 2: Cấp quyền LogMiner/catalog, rồi quyền SELECT/FLASHBACK trong FREEPDB1.
 -- Template only. Invoke-OracleSetup.ps1 supplies the password in memory.
 -- Execute as SYSDBA in CDB$ROOT after checking USERS tablespace in both containers.
 -- Intentionally fail if this common user already exists; do not replace its password.

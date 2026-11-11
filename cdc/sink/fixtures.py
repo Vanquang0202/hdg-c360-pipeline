@@ -1,3 +1,6 @@
+# Mục đích: Sinh Debezium event giả lập để chạy demo/test Sink độc lập.
+# Đầu vào: Schema nguồn và các ảnh dòng do test/CLI cung cấp.
+# Đầu ra: Manifest, c/u/d, metadata giao dịch và tombstone; không phát DML Oracle/Kafka.
 """Synthetic Debezium schema+payload events with explicit empty/seeded test baselines."""
 import base64
 import copy
@@ -39,6 +42,7 @@ def binary_integer(number):
 
 
 def encoded_value(v,f):
+    # Đổi dữ liệu giả lập sang logical type Debezium exact, để test đúng đường giải mã của Sink.
     if v is None:
         return None
     if f.get("name")=="io.debezium.data.VariableScaleDecimal":
@@ -114,6 +118,7 @@ class Builder:
         return self.emit(self.prefix+".transaction",None,envelope_bytes(schema,payload))
 
     def transaction(self,operations,commit=None,txid=None,tombstone=False):
+        # Sinh BEGIN, DML và END khớp số lượng; đây là dữ liệu giả, không ghi Oracle/Kafka.
         number=len(self.frames)+1
         txid=txid or "fixture.1."+str(number)
         commit=commit or 100+number*10
@@ -151,6 +156,7 @@ class Builder:
         return len(self.frames)-1
 
     def clone(self,frame_no):
+        # Phát lại cùng sự kiện nguồn tại offset mới để kiểm ledger không áp dữ liệu lần hai.
         old=self.frames[frame_no]
         lookup={r.coordinate:r for r in self.records}
         first=len(self.records)
@@ -175,6 +181,7 @@ class Builder:
 
 
 def demo():
+    # Tạo c/u/d/tombstone và một lượt replay INSERT cũ; baseline độc lập, không phải SCN cutover.
     b=Builder()
     dbhc=image("VSS_DM_DBHC",ma_dbhc="00004",ma_cha="01TTT",ten="Phường thử nghiệm",
                id=Decimal("99999999999999999999"),ngay_hieu_luc=datetime(2026,11,11,12,34,56,123456))

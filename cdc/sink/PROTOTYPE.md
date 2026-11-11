@@ -17,17 +17,16 @@ Bài test/demo dùng **synthetic events độc lập**, không phải bản expo
 | contract.py | Đọc lại jobs/schema_contract.py và DDL Oracle, hash hợp đồng; không sửa chúng |
 | protocol.py | Giải mã Debezium JSON schema/payload, kiểm đủ cột và chuyển kiểu exact |
 | storage.py | Guard endpoint/database, tạo đủ 132 cột ở Mirror test, metadata và SQL NULL-safe |
-| manifest.py | Baseline thử nghiệm, các range offset hữu hạn và giao dịch hoàn chỉnh |
-| engine.py | Áp một giao dịch, inbox/ledger/checkpoint cùng transaction, quarantine khi lỗi |
+| engine.py | Kiểm manifest/baseline/range rồi áp một giao dịch, inbox/ledger/checkpoint cùng transaction, quarantine khi lỗi |
 | kafka_reader.py | Đọc hữu hạn các range đã khai báo; pin topic ID; không commit/reset Kafka offsets |
 | fixtures.py | Sinh schema+payload synthetic cho bốn bảng, có replay/tombstone |
 | run.py | CLI generate/init/replay/reset-test, retry lỗi DB có giới hạn |
 | compose.test.yaml | PostgreSQL test độc lập, giới hạn RAM 256 MiB, shared_buffers 32 MiB |
 | Setup-Test.ps1 | Chuẩn bị riêng container test, giữ credential/volume và tùy chọn chạy test |
 | requirements.txt | Dependency cố định trong venv riêng |
-| tests/test_unit.py | Unit test parser, manifest, endpoint, retry và Kafka reader giả lập |
-| tests/test_integration.py | Integration trên PostgreSQL thật, chỉ reset các bảng fixture test |
-| tests/crash_worker.py | Tiến trình con dùng để kiểm tra crash thật trước/sau commit |
+| ../../tests/cdc_sink/test_unit.py | Unit test parser, manifest, endpoint, retry và Kafka reader giả lập |
+| ../../tests/cdc_sink/test_integration.py | Integration trên PostgreSQL thật, chỉ reset các bảng fixture test |
+| ../../tests/cdc_sink/crash_worker.py | Tiến trình con dùng để kiểm tra crash thật trước/sau commit |
 
 Lựa chọn Python/Psycopg ở đây dành cho CDC prototype. Job Full Load Spark/JDBC không thay đổi.
 
@@ -113,8 +112,8 @@ Setup-Test.ps1 tạo mật khẩu ngẫu nhiên một lần vào `.env.test` đ�
 Script từ chối container trùng tên thuộc project khác. Nó không tải image, không nối network CDC cũ, không xóa volume và chỉ chạy tests khi có -RunTests. Có thể chạy riêng:
 
 ```powershell
-& .\cdc\sink\.venv\Scripts\python.exe -B -m unittest discover -s cdc/sink/tests -p test_unit.py -v
-& .\cdc\sink\.venv\Scripts\python.exe -B -m unittest discover -s cdc/sink/tests -p test_integration.py -v
+& .\cdc\sink\.venv\Scripts\python.exe -B -m unittest discover -s tests/cdc_sink -p test_unit.py -v
+& .\cdc\sink\.venv\Scripts\python.exe -B -m unittest discover -s tests/cdc_sink -p test_integration.py -v
 ```
 
 Integration tự tạo schemas test nếu chưa có và reset **chỉ 11 bảng fixture của prototype** trước mỗi test. Không chạy khi đang cần giữ dữ liệu thử nghiệm quan trọng. Sau test negative có thể thấy epoch BLOCKED; đây là kết quả mong đợi của test, không phải bằng chứng suite FAIL.
@@ -204,6 +203,6 @@ Các điều kiện prototype trên đã qua bộ test nêu trên, trong phạm 
 
 **Chưa đủ để bật live:** source-event identity thật qua Debezium restart; full before/after của NHANKHAU và các dạng DML khác; assembler streaming nhiều topic/giao dịch lớn; frontier toàn cục; barrier giữa SCN và offsets; restore giữ FK/trigger/Queue; vận hành retention/lag và bảo mật production. Không có Kafka DLQ producer, quarantine nằm ở PostgreSQL và cần quy trình xử lý riêng. Kafka network adapter mới được unit test bằng mock, chưa có bằng chứng kết nối broker thật.
 
-Nguồn test không chứa toàn bộ trạng thái Recovery Candidate tại SCN 2438031. Prototype không thay thế bước thiết kế cutover trong [CDC_SINK_CUTOVER_DESIGN.md](../CDC_SINK_CUTOVER_DESIGN.md). Muốn nâng cấp tiếp cần thu raw schema/key/value/transaction metadata của cả bốn bảng, chứng minh baseline và replay nguồn thực tế trên test, rồi mới xem xét một kế hoạch live riêng.
+Nguồn test không chứa toàn bộ trạng thái Recovery Candidate tại SCN 2438031. Prototype không thay thế bước thiết kế cutover trong [CDC_SINK_CUTOVER_DESIGN.md](../../archive/cdc/CDC_SINK_CUTOVER_DESIGN.md). Muốn nâng cấp tiếp cần thu raw schema/key/value/transaction metadata của cả bốn bảng, chứng minh baseline và replay nguồn thực tế trên test, rồi mới xem xét một kế hoạch live riêng.
 
 Sau khi lấy bằng chứng cuối, đã dừng riêng hdg-cdc-sink-test để tiết kiệm RAM; volume test và fixture được giữ. Các container Oracle, PostgreSQL live, Kafka, Connect và Superset đang chạy vẫn được giữ nguyên vòng đời. Chạy Setup-Test.ps1 để mở lại endpoint test.

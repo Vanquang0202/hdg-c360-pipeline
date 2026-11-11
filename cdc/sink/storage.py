@@ -1,3 +1,6 @@
+# Mục đích: Tạo/kiểm schema và thực hiện SQL chỉ trong PostgreSQL test riêng.
+# Đầu vào: Kết nối đúng endpoint test, hợp đồng kiểu và giá trị đã giải mã.
+# Đầu ra: Bảng test cùng metadata; mọi kết nối sai đích bị chặn trước khi ghi.
 """PostgreSQL test-only storage; host/port/database/schema cannot be overridden."""
 import os
 from pathlib import Path
@@ -10,6 +13,7 @@ TOKEN = "hdg-cdc-sink-prototype-test-only-v1"
 HERE = Path(__file__).resolve().parent
 
 
+# Mật khẩu chỉ lấy từ môi trường hoặc .env.test local; không đọc cấu hình Mirror live.
 def password():
     supplied = os.environ.get("CDC_TEST_PASSWORD")
     if supplied:
@@ -23,6 +27,7 @@ def password():
 
 
 def connect_test():
+    # BƯỚC 1: Kết nối cố định test DB/cổng 55433; không có tùy chọn rơi về PostgreSQL live.
     connection = psycopg.connect(host="127.0.0.1", port=PORT, dbname=DATABASE,
                                  user="sink_test_owner", password=password(), autocommit=True,
                                  connect_timeout=5, options="-c search_path=pg_catalog -c timezone=UTC")
@@ -36,6 +41,7 @@ def connect_test():
 
 
 def ddl():
+    # Dựng bảng test từ contract v2; giữ PK đúng hai danh mục và byte-check cho chuỗi.
     parts = [
         "CREATE SCHEMA mirror_test", "CREATE SCHEMA sink_meta",
         """CREATE TABLE sink_meta.guard(
@@ -79,12 +85,14 @@ def ddl():
 
 
 def assert_endpoint(connection):
+    # Chặn sai host/cổng/database/user trước SQL tạo hoặc sửa fixture.
     if (connection.info.dbname!=DATABASE or connection.info.host!="127.0.0.1"
             or connection.info.port!=PORT or connection.info.user!="sink_test_owner"):
         raise ValueError("Refusing non-test endpoint")
 
 
 def bootstrap(connection):
+    # BƯỚC 2: Chỉ tạo schema khi chưa có và không chiếm cấu trúc lạ; marker/hash giữ đúng môi trường test.
     assert_endpoint(connection)
     if connection.execute("SELECT to_regclass('sink_meta.guard')").fetchone()[0] is not None:
         assert_target(connection)
@@ -99,6 +107,7 @@ def bootstrap(connection):
 
 
 def assert_target(connection):
+    # BƯỚC 3: Kiểm marker, đủ kiểu/NULL/PK/byte-check và các dependency không được phép.
     assert_endpoint(connection)
     if not connection.autocommit or connection.info.dbname != DATABASE:
         raise ValueError("Test connection must use autocommit and the dedicated test database")
@@ -149,6 +158,7 @@ def insert_row(connection, table, values):
 
 
 def matching_where(table, image, names=None):
+    # So NULL-safe trên mọi cột before; collation C giữ khác biệt chuỗi/khoảng trắng.
     columns = [c for c in table["columns"] if names is None or c["name"] in names]
     expressions = []
     parameters = []
@@ -163,6 +173,7 @@ def matching_where(table, image, names=None):
 
 def reset_test_fixture(connection):
     """Explicitly destroy ONLY prototype fixtures after verifying the fixed test endpoint."""
+    # Chỉ reset bảng test được liệt kê sau khi xác nhận endpoint/marker; không dùng để sửa lỗi live.
     assert_target(connection)
     names=[("sink_meta",name) for name in (
         "quarantine","frames","transaction_ledger","event_ledger","inbox","checkpoints","epochs")]

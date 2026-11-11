@@ -1,3 +1,6 @@
+-- Mục đích: publisher gọi guard tương ứng để không cắt chuỗi hoặc làm tròn dữ liệu.
+-- Đầu vào: giá trị text từ Stage và giới hạn kiểu trong contract Oracle.
+-- Đầu ra: giá trị nguyên vẹn hoặc lỗi; template này được bộ sinh nhúng vào publisher/migration.
 -- Included by build_full_load_sql.py in the publish deployment script.
 CREATE OR REPLACE FUNCTION hdg_load.checked_text(v text, n integer, byte_semantics boolean)
 RETURNS text LANGUAGE plpgsql IMMUTABLE STRICT SET search_path=pg_catalog AS $f$

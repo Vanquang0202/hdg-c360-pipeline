@@ -1,3 +1,6 @@
+# Mục đích: Giải mã Debezium JSON có schema/payload mà không làm mất giá trị.
+# Đầu vào: Raw key/value, logical type, danh tính nguồn và hợp đồng Oracle.
+# Đầu ra: Ảnh trước/sau exact, thông tin giao dịch và fingerprint; không kết nối DB/Kafka.
 """Strict schema-aware Debezium decoder. No database or Kafka I/O."""
 import base64
 import hashlib
@@ -32,6 +35,7 @@ def _object(pairs):
 
 
 def loads(raw):
+    # BƯỚC 1: Đọc JSON không qua float; từ chối key lặp, NaN và message vượt giới hạn.
     if not isinstance(raw, (bytes, str)) or len(raw) > MAX_MESSAGE_BYTES:
         reject("MESSAGE_SIZE_OR_TYPE")
     try:
@@ -42,6 +46,7 @@ def loads(raw):
 
 
 def canonical(value):
+    # Chuẩn hóa biểu diễn để băm exact, không sửa giá trị nghiệp vụ hoặc gộp các source event khác nhau.
     if isinstance(value, Decimal):
         if not value.is_finite():
             reject("NONFINITE_NUMBER")
@@ -92,6 +97,7 @@ def unscaled(raw):
 
 
 def exact_decimal(number, scale):
+    # Dựng Decimal từ hệ số và scale, tránh bị context mặc định làm tròn số nhiều chữ số.
     scale = integer(scale, "decimal scale")
     if abs(scale) > 1000:
         reject("DECIMAL_SCALE_RANGE")
@@ -129,6 +135,7 @@ def check_descriptor(field, column):
 
 
 def descriptors(schema, table):
+    # BƯỚC 2: Kiểm schema đủ cột và logical type trước khi đọc dữ liệu.
     if not isinstance(schema, dict) or schema.get("type") != "struct":
         reject("ROW_SCHEMA_REQUIRED")
     fields = schema.get("fields", [])
@@ -144,6 +151,7 @@ def descriptors(schema, table):
 
 
 def value(raw, field, column):
+    # BƯỚC 3: Giữ NULL/chuỗi/số/ngày theo contract; không cắt chuỗi hoặc bỏ phần giây lẻ.
     if raw is None:
         if column["required"]:
             reject("REQUIRED_NULL", column["name"])
@@ -218,6 +226,7 @@ def value(raw, field, column):
 
 
 def row(raw, schema, table):
+    # BƯỚC 4: Ảnh dòng phải đủ trường; thiếu field không được tự coi là NULL.
     fields = descriptors(schema, table)
     if not isinstance(raw, dict) or set(raw) != {c["name"].upper() for c in table["columns"]}:
         reject("MISSING_OR_EXTRA_ROW_FIELD", table["mirror"])
@@ -270,6 +279,8 @@ class Record:
 
 
 def _decode(record, prefix, incarnation):
+    # BƯỚC 5: Phân biệt tombstone/control/c-u-d, kiểm ảnh trước/sau rồi tạo danh tính sự kiện.
+    # Tombstone chỉ đánh dấu kết thúc record cũ, không phải một lệnh DELETE thứ hai.
     if record.value is None:
         return dict(kind="tombstone")
     schema, payload = envelope(record.value)
@@ -306,6 +317,7 @@ def _decode(record, prefix, incarnation):
         (op == "u" and (before is None or after is None)) or
         (op == "d" and (before is None or after is not None))):
         reject("OPERATION_IMAGES")
+    # Kiểm nguồn, commit SCN và thứ tự trong giao dịch; không nhầm SCN của DML với SCN commit.
     source = payload.get("source")
     transaction = payload.get("transaction")
     if not isinstance(source, dict) or not isinstance(transaction, dict):
@@ -337,6 +349,7 @@ def _decode(record, prefix, incarnation):
             reject("KEY_IMAGE_MISMATCH")
     elif record.key is not None:
         reject("UNEXPECTED_KEY_NO_PK", "prototype policy requires key-null for no-PK tables")
+    # Danh tính redo này phục vụ prototype; chưa chứng minh ổn định qua restart Debezium thực tế.
     identity = digest([incarnation, table_name, source["txId"], scn, commit,
                        source["rs_id"], ssn, thread, op, key_data])
     fingerprint = digest(dict(table=table_name, op=op, before=before, after=after,
@@ -348,6 +361,7 @@ def _decode(record, prefix, incarnation):
 
 
 def decode(record, prefix, incarnation):
+    # Đưa lỗi cấu trúc về cùng mã Rejected để applier rollback và lưu quarantine.
     try:
         return _decode(record,prefix,incarnation)
     except Rejected:

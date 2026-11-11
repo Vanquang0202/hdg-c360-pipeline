@@ -1,9 +1,16 @@
+# Mục đích: Kiểm tra Spark local nạp được cả Oracle và PostgreSQL JDBC driver.
+# Đầu vào: Classpath do run_spark.ps1 truyền vào; không cần mật khẩu DB.
+# Đầu ra: Log class nạp ở driver/executor; không mở kết nối database.
 """Check local Spark JDBC classpaths without opening database connections."""
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "jobs"))
 from spark_common import create_spark, log
 from pyspark.sql import functions as F
 
 
 def main():
+    # BƯỚC 1: Mở Spark, nạp hai class JDBC ở driver và task executor rồi dừng; không gọi connect DB.
     spark = create_spark("HDG-check-jdbc")
     try:
         drivers = ["oracle.jdbc.OracleDriver", "org.postgresql.Driver"]

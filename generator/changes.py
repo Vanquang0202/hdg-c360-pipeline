@@ -1,3 +1,6 @@
+# Mục đích: Lập kế hoạch hoặc áp dụng một kịch bản biến động để thử CDC.
+# Đầu vào: Tên kịch bản, fixture đã seed và tùy chọn --apply.
+# Đầu ra: Một transaction INSERT/UPDATE/DELETE có kiểm tra đúng fixture; mặc định chỉ in kế hoạch.
 """Plan or apply repeatable HDG CDC scenarios against seeded fixture rows.
 
 Examples from the project root in PowerShell:
@@ -49,6 +52,7 @@ def current_count(cursor, code):
 
 
 def require_fixture(cursor, row):
+    # ID chỉ được dùng cho fixture này sau khi kiểm cả khóa hộ và tính duy nhất hiện tại, không phải khóa nguồn mặc định.
     cursor.execute(
         f"""SELECT ID, GHI_CHU FROM {PEOPLE}
             WHERE MA_CD=:code
@@ -81,6 +85,7 @@ def inserted_people(count, changed_at):
 def mutate(cursor, scenario, count, batch_size):
     # One transaction and a fail-fast writer lock make each small demo
     # scenario atomic. Readers/CDC can continue reading committed data.
+    # BƯỚC 2: Lấy khóa writer, kiểm fixture còn nguyên rồi áp đúng một kịch bản trong transaction.
     cursor.execute(f"LOCK TABLE {PEOPLE} IN EXCLUSIVE MODE NOWAIT")
     changed_at = max(datetime.now().replace(microsecond=0),
                      BASE_DATE + timedelta(days=2))
@@ -156,6 +161,7 @@ def mutate(cursor, scenario, count, batch_size):
 
 
 def main():
+    # BƯỚC 1: Đọc kịch bản; chỉ kết nối và ghi Oracle khi người chạy có --apply.
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("scenario", choices=list(DESCRIPTIONS))
@@ -173,9 +179,11 @@ def main():
     if args.scenario != "insert":
         row = fixtures()[TARGETS[args.scenario]]
         print("Target", row["ID"], row["MA_CD"], row["MA_HO_GD"])
+    # Thiếu --apply thì dừng ở bản kế hoạch, chưa có kết nối hoặc thay đổi Oracle.
     if not args.apply:
         print("Plan only. Add --apply to commit this scenario.")
         return
+    # BƯỚC 3: Kiểm guard, áp một kịch bản và commit cùng nhau; lỗi sẽ không ghi một phần.
     with connect() as connection, connection.cursor() as cursor:
         affected = mutate(cursor, args.scenario, args.count, args.batch_size)
         connection.commit()

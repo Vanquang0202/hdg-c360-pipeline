@@ -1,12 +1,117 @@
+# Mục đích: Kiểm manifest/baseline rồi áp giao dịch nguồn hoàn chỉnh vào Mirror test.
+# Đầu vào: Record đã gom đủ, epoch/baseline và kết nối PostgreSQL test.
+# Đầu ra: Mirror, inbox, ledger và checkpoint commit nguyên khối; lỗi dữ liệu được quarantine.
 """Atomic test-only transaction applier. No Source configuration or Kafka offset writes."""
+import uuid
 from collections import Counter
 from psycopg import sql
 from psycopg.types.json import Jsonb
 import psycopg
-from contract import TABLES
-from manifest import validate, manifest_hash
-from protocol import decode, digest, canonical, integer, row, Rejected
+from contract import TABLES, CONTRACT_HASH
+from protocol import decode, digest, canonical, integer, row, Rejected, loads
 from storage import assert_target, insert_row, relation, matching_where
+
+
+# BƯỚC 1: Kiểm baseline, contract và offset đã khai báo trước khi áp giao dịch.
+
+
+def validate(document):
+    # BƯỚC 1: Baseline phải được khai báo cho đủ bốn bảng, cùng range hữu hạn; không suy baseline từ offset.
+    if not isinstance(document, dict) or document.get("format") != "hdg-sink-prototype-v1":
+        raise Rejected("MANIFEST_FORMAT")
+    if document.get("mode") not in ("synthetic-test", "captured-fixture-test"):
+        raise Rejected("TEST_MANIFEST_REQUIRED", "no live/cutover mode exists")
+    if document.get("identity_policy") != "experimental-redo-v1":
+        raise Rejected("IDENTITY_POLICY")
+    uuid.UUID(document["epoch"])
+    if document.get("contract_hash") != CONTRACT_HASH:
+        raise Rejected("MANIFEST_CONTRACT_HASH")
+    if not isinstance(document.get("source_incarnation"), str) or not document["source_incarnation"]:
+        raise Rejected("SOURCE_INCARCATION_REQUIRED")
+    prefix = document.get("topic_prefix")
+    if prefix not in ("hdg_sink_test", "hdg_observe"):
+        raise Rejected("TOPIC_PREFIX")
+    baseline = document.get("baseline")
+    if not isinstance(baseline, dict) or baseline.get("assertion") != "verified-test-baseline":
+        raise Rejected("EXPLICIT_BASELINE_REQUIRED")
+    integer(baseline.get("scn"), "test baseline SCN", 0)
+    tables = baseline.get("tables", {})
+    if set(tables) != set(TABLES):
+        raise Rejected("BASELINE_ALL_FOUR_TABLES")
+    for source, spec in tables.items():
+        if not isinstance(spec.get("rows"), list):
+            raise Rejected("BASELINE_ROWS")
+        # Validate schema even when the declared baseline is empty.
+        from protocol import descriptors
+        descriptors(spec.get("schema"), TABLES[source])
+        for raw in spec["rows"]:
+            row(raw, spec["schema"], TABLES[source])
+    streams = {}
+    allowed = {prefix + ".VSS." + source for source in TABLES} | {prefix + ".transaction"}
+    for spec in document.get("streams", []):
+        if spec.get("topic") not in allowed or integer(spec.get("partition"), "partition", 0) != 0:
+            raise Rejected("PROTOTYPE_ONE_PARTITION")
+        if not isinstance(spec.get("topic_id"), str) or not spec["topic_id"]:
+            raise Rejected("TOPIC_ID_REQUIRED")
+        key = spec["topic"], spec["partition"]
+        if key in streams:
+            raise Rejected("DUPLICATE_STREAM")
+        start = integer(spec.get("start"), "start offset", 0)
+        end = integer(spec.get("end"), "end offset", 0)
+        if end < start or end - start > 100000:
+            raise Rejected("BOUNDED_RANGE_REQUIRED")
+        streams[key] = spec
+    if {topic for topic, _ in streams} != allowed:
+        raise Rejected("ALL_STREAM_RANGES_REQUIRED")
+    if sum(s["end"]-s["start"] for s in streams.values())>100000:
+        raise Rejected("PROTOTYPE_RECORD_LIMIT")
+    coordinates = []
+    for frame in document.get("frames", []):
+        integer(frame.get("event_count"), "frame event_count", 0)
+        if not frame.get("records"):
+            raise Rejected("EMPTY_FRAME")
+        for coordinate in frame["records"]:
+            if not isinstance(coordinate, list) or len(coordinate) != 3:
+                raise Rejected("FRAME_COORDINATE")
+            topic, partition, offset = coordinate
+            key = topic, partition
+            if key not in streams or not streams[key]["start"] <= offset < streams[key]["end"]:
+                raise Rejected("FRAME_RANGE")
+            coordinates.append(tuple(coordinate))
+    expected = sum(s["end"]-s["start"] for s in streams.values())
+    if len(coordinates) != expected or len(set(coordinates)) != expected:
+        raise Rejected("FINITE_RANGE_NOT_FULLY_COVERED")
+    return document
+
+
+def manifest_hash(document):
+    return digest(document)
+
+
+def load(path):
+    return validate(loads(path.read_bytes()))
+
+
+def check_records(document, records):
+    # BƯỚC 2: Pin topic ID và kiểm đủ tọa độ/range; thiếu một record cũng phải dừng.
+    spec = {(s["topic"],s["partition"]):s for s in document["streams"]}
+    found = {}
+    total_bytes = 0
+    for record in records:
+        coordinate = record.coordinate
+        stream = spec.get(coordinate[:2])
+        if stream is None or record.topic_id != stream["topic_id"]:
+            raise Rejected("TOPIC_ID_OR_STREAM")
+        if not stream["start"] <= record.offset < stream["end"] or coordinate in found:
+            raise Rejected("RECORD_OUTSIDE_FINITE_RANGE")
+        found[coordinate] = record
+        total_bytes += len(record.value or b"") + len(record.key or b"")
+        if total_bytes > 64*1024*1024:
+            raise Rejected("PROTOTYPE_BATCH_MEMORY_LIMIT")
+    expected = {tuple(c) for frame in document["frames"] for c in frame["records"]}
+    if set(found) != expected:
+        raise Rejected("INCOMPLETE_FIXTURE")
+    return found
 
 
 class SimulatedCrash(RuntimeError):
@@ -14,6 +119,7 @@ class SimulatedCrash(RuntimeError):
 
 
 def initialize(connection, document):
+    # BƯỚC 2: Khóa epoch và nạp baseline đã khai báo; không ghi đè trạng thái test đang có.
     validate(document)
     assert_target(connection)
     with connection.transaction():
@@ -37,6 +143,7 @@ def initialize(connection, document):
 
 
 def transaction(events, spec, incarnation):
+    # BƯỚC 3: Gom đúng giao dịch, kiểm END/count/order; thiếu sự kiện thì chưa được áp vào Mirror.
     dml = [event for event in events if event["kind"] == "dml"]
     controls = [event["payload"] for event in events if event["kind"] == "control"]
     if not dml:
@@ -84,6 +191,7 @@ def transaction(events, spec, incarnation):
 
 
 def apply_dml(connection, event):
+    # BƯỚC 5: INSERT mới hoặc match toàn bộ before; UPDATE/DELETE chỉ tác động một bản sao, kể cả dòng trùng/NULL.
     table=TABLES[event["table"]]
     if event["op"]=="c":
         if table["primary_key"]:
@@ -113,6 +221,7 @@ def apply_dml(connection, event):
 
 
 def _quarantine(connection,epoch,frame_no,records,error):
+    # Lưu bằng chứng lỗi bằng transaction riêng sau rollback; BLOCKED ngăn job bỏ qua lỗi và tiếp tục checkpoint.
     with connection.transaction():
         connection.execute("SELECT pg_advisory_xact_lock(631874,1)")
         connection.execute(
@@ -125,6 +234,7 @@ def _quarantine(connection,epoch,frame_no,records,error):
 
 def apply_frame(connection, document, frame_no, records, failpoint=None):
     """Each complete finite source transaction + its metadata commits atomically."""
+    # BƯỚC 4: Kiểm manifest/đích, rồi giữ Mirror, inbox, dedup và checkpoint trong cùng một transaction.
     assert_target(connection)
     validate(document)
     spec=document["frames"][frame_no]
@@ -142,6 +252,7 @@ def apply_frame(connection, document, frame_no, records, failpoint=None):
                 raise Rejected("EPOCH_BLOCKED")
             if [list(r.coordinate) for r in records]!=spec["records"]:
                 raise Rejected("FRAME_RECORDS")
+            # Frame đã commit chỉ được nhận lại khi raw fingerprint trùng; không áp DML lần hai.
             if frame_no<state[2]:
                 old=connection.execute("SELECT fingerprint FROM sink_meta.frames WHERE epoch=%s AND frame_no=%s",
                                        (epoch,frame_no)).fetchone()
@@ -150,6 +261,7 @@ def apply_frame(connection, document, frame_no, records, failpoint=None):
                 return "REPLAY_FRAME"
             if frame_no!=state[2]:
                 raise Rejected("FRAME_ORDER")
+            # BƯỚC 5: next_offset phải liên tục và đúng topic ID; mọi cập nhật ở đây còn nằm trong transaction.
             stream_specs={(s["topic"],s["partition"]):s for s in document["streams"]}
             for record in records:
                 stream=stream_specs.get((record.topic,record.partition))
@@ -163,12 +275,14 @@ def apply_frame(connection, document, frame_no, records, failpoint=None):
                 connection.execute(
                     "UPDATE sink_meta.checkpoints SET next_offset=next_offset+1 WHERE epoch=%s AND topic=%s "
                     "AND partition=%s",(epoch,record.topic,record.partition))
+            # BƯỚC 6: Kiểm đủ schema, ảnh dòng và END giao dịch trước khi thay đổi Mirror test.
             events=[decode(r,document["topic_prefix"],document["source_incarnation"]) for r in records]
             tx=transaction(events,spec,document["source_incarnation"])
             outcome="TOMBSTONE_ONLY"
             if tx is not None:
                 if tx["commit"]<=document["baseline"]["scn"]:
                     raise Rejected("EVENT_NOT_AFTER_TEST_BASELINE", "no automatic baseline skip/cutover")
+                # Chống replay nguồn ở offset mới bằng ledger; row_id không phải khóa dòng lâu dài.
                 old=connection.execute(
                     "SELECT fingerprint FROM sink_meta.transaction_ledger WHERE epoch=%s AND source_tx=%s",
                     (epoch,tx["key"])).fetchone()
@@ -201,6 +315,7 @@ def apply_frame(connection, document, frame_no, records, failpoint=None):
                     outcome="APPLIED"
             if failpoint:
                 failpoint("after_dml")
+            # BƯỚC 7: Lưu inbox/kết quả cùng ledger và checkpoint; lỗi trước commit sẽ rollback tất cả.
             for record,event in zip(records,events):
                 record_outcome=("TOMBSTONE" if event["kind"]=="tombstone" else
                                 "CONTROL" if event["kind"]=="control" else outcome)

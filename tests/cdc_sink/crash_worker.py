@@ -1,9 +1,13 @@
+# Mục đích: Tiến trình con để kiểm tra crash trước/sau commit của Sink test.
+# Đầu vào: Manifest, JSONL và tên failpoint do integration test truyền.
+# Đầu ra: Thoát tiến trình tại điểm đã chọn để kiểm tra rollback/replay; không import để chạy ứng dụng.
 """Integration subprocess: abruptly terminate only this test applier process."""
 import os
 import sys
 from pathlib import Path
-sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
-from manifest import load, check_records
+# Nạp module runtime ở vị trí gốc; test không chứa bản sao code Sink.
+sys.path.insert(0,str(Path(__file__).resolve().parents[2] / "cdc/sink"))
+from engine import load, check_records
 from protocol import loads, Record
 from storage import connect_test
 from engine import apply_frame

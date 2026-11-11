@@ -1,5 +1,11 @@
+# Mục đích: Kiểm tra đối soát exact bằng Spark với dữ liệu nhỏ trong bộ nhớ.
+# Đầu vào: Các chuỗi số, NULL, dòng trùng và thời gian giả lập.
+# Đầu ra: Kết quả test Spark local; không mở JDBC/database.
 """Offline Spark transport tests. Creates small DataFrames without JDBC connections."""
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "jobs"))
 import os
 import sys
 import unittest
@@ -18,6 +24,7 @@ from spark_common import canonical_number, reconcile_frames
 
 class TransportTests(unittest.TestCase):
     @classmethod
+    # Các ca này cần mở Spark local; không nằm trong lượt kiểm tra tối thiểu khi chỉ thêm comment.
     def setUpClass(cls):
         cls.spark = (SparkSession.builder.master("local[1]")
                      .appName("HDG transport tests")

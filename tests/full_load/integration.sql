@@ -1,3 +1,9 @@
+-- Mục đích: kiểm hồi quy mapping, publish, migration và recovery trong database test riêng.
+-- Đầu vào: database hdg_full_load_test rỗng; các lệnh đi kèm dùng đường dẫn tương đối hiện tại.
+-- Đầu ra: assertion hoặc lỗi; file này có DDL/DML fixture, không chạy trên hdg_mirror.
+-- BƯỚC 1: Kiểm đúng database trước khi include DDL và publisher.
+-- BƯỚC 2: Nạp fixture, kiểm replay/NOOP và các lỗi mất dữ liệu cùng COUNT.
+-- BƯỚC 3: Thử migration/candidate trong test; không ghi Mirror live.
 \set ON_ERROR_STOP on
 -- ONLY a separately provisioned, empty test database. Never hdg_mirror.
 DO $test$ BEGIN

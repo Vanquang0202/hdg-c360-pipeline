@@ -1,3 +1,6 @@
+# Mục đích: Tạo dữ liệu giả lập cho bốn bảng VSS khi nguồn đang rỗng.
+# Đầu vào: Biến môi trường Oracle, số dòng và batch size; không đọc mật khẩu từ source.
+# Đầu ra: Các lô danh mục/nhân khẩu và số dòng đã kiểm tra, commit một lần.
 """Generate identifiable HDG fixtures for the supplied VSS schema.
 
 PowerShell from the project root:
@@ -198,6 +201,7 @@ def positive_int(value):
 
 
 def connect():
+    # Đọc đủ biến môi trường rồi mới mở Oracle; thiếu cấu hình thì dừng, không dùng mật khẩu mặc định.
     names = ("ORACLE_USER", "ORACLE_PASSWORD", "ORACLE_DSN")
     missing = [name for name in names if not os.environ.get(name)]
     if missing:
@@ -212,6 +216,7 @@ def connect():
 
 
 def insert_batches(cursor, table, rows, batch_size):
+    # Gom từng batch và executemany để giảm số lần gọi Oracle; hàm này không tự commit.
     iterator = iter(rows)
     columns = None
     inserted = 0
@@ -236,11 +241,13 @@ def counts(cursor):
 def seed(cursor, count, batch_size):
     # Lock before checking emptiness, including the tables without a PK.
     # The caller commits only after the counts have been verified.
+    # Khóa bốn bảng và kiểm rỗng trước khi nạp; chống hai lần seed đồng thời và tránh nhân đôi.
     for table in TABLES:
         cursor.execute(f"LOCK TABLE {table} IN EXCLUSIVE MODE NOWAIT")
     current = counts(cursor)
     if any(current.values()):
         raise RuntimeError(f"Seed requires four empty source tables. Current counts: {current}")
+    # BƯỚC 2: Nạp danh mục trước, rồi nhân khẩu theo batch; kiểm lại số dòng trước khi caller commit.
     expected = {table: len(rows) for table, rows in CATALOGS.items()}
     expected[PEOPLE] = count
     for table, rows in CATALOGS.items():
@@ -253,6 +260,7 @@ def seed(cursor, count, batch_size):
 
 
 def main():
+    # BƯỚC 1: Chọn seed/counts/fixtures; chỉ nhánh seed được phép commit dữ liệu mới.
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -268,6 +276,7 @@ def main():
         return
     if args.command == "seed" and not len(fixtures()) <= args.count <= 99_999_999:
         parser.error(f"--count must be between {len(fixtures())} and 99999999")
+    # BƯỚC 3: Chỉ mở Oracle sau khi tham số hợp lệ; counts chỉ đọc, seed mới commit.
     with connect() as connection, connection.cursor() as cursor:
         if args.command == "seed":
             result = seed(cursor, args.count, args.batch_size)

@@ -1,3 +1,6 @@
+# Mục đích: Thư viện kết nối JDBC, vận chuyển giá trị exact và so sánh dữ liệu.
+# Đầu vào: Cấu hình kết nối, hợp đồng kiểu, SCN và run_id từ job gọi.
+# Đầu ra: Spark DataFrame, kết quả đối soát và lệnh metadata trong transaction do job quản lý.
 """Shared Spark JDBC metadata, transport and reconciliation helpers."""
 
 import json
@@ -18,6 +21,7 @@ def log(event, **fields):
 
 
 def settings():
+    # BƯỚC 1: Đọc biến môi trường/.env, giữ mật khẩu ngoài URL và source.
     from dotenv import load_dotenv
 
     load_dotenv(ROOT / "jobs/.env", override=False)
@@ -43,6 +47,7 @@ def settings():
 
 
 def create_spark(name):
+    # BƯỚC 2: Mở Spark đúng phiên bản, giới hạn song song và dùng UTC khi xử lý thời gian.
     from pyspark.sql import SparkSession
 
     spark = (
@@ -66,6 +71,7 @@ def create_spark(name):
 
 @contextmanager
 def jdbc_connection(spark, config, database):
+    # Mở JDBC qua JVM để điều khiển transaction/metadata; không dùng Python để copy dữ liệu.
     jvm = spark.sparkContext._jvm
     driver = "oracle.jdbc.OracleDriver" if database == "oracle" else "org.postgresql.Driver"
     # Use the context classloader to load drivers from the configured classpath.
@@ -95,6 +101,7 @@ def execute(connection, sql, parameters=()):
 
 def write_table_audit(connection, run_id, source, table, source_rows, stage_rows, elapsed, with_digest):
     """Record the source/stage comparison without requiring a legacy DB migration."""
+    # Stage cũ ghi audit cũ; chỉ gọi digest khi preflight đã xác nhận đủ chức năng.
     columns = "run_id,source_table,source_rows,stage_rows,elapsed_seconds,content_equal"
     values = "?,?,?::bigint,?::bigint,?::numeric,true"
     parameters = (run_id, source, source_rows, stage_rows, elapsed)
@@ -154,6 +161,7 @@ def date_format(column, oracle):
 
 
 def transport_projection(table, database):
+    # BƯỚC 3: Đưa NUMBER/ngày sang chuỗi exact để Spark không tự làm tròn hoặc mất giờ.
     parts = []
     for column in table["columns"]:
         name = column["name"]
@@ -170,6 +178,7 @@ def transport_projection(table, database):
 
 
 def read_source(spark, config, source, table, scn):
+    # SCN chốt cùng một ảnh Oracle cho cả count và các lần đọc lại; không tự chuyển sang dữ liệu hiện tại.
     version = "" if scn is None else f" AS OF SCN {int(scn)}"
     return read_jdbc(
         spark, config, "oracle",
@@ -178,6 +187,7 @@ def read_source(spark, config, source, table, scn):
 
 
 def read_target(spark, config, table, run_id, target, mirror_namespace="public"):
+    # Chỉ đọc Stage của run_id hoặc bảng đích đã chọn, giữ nguyên toàn bộ giá trị vận chuyển.
     if mirror_namespace != "public" and not re.fullmatch(r"hdg_recovery_[a-z0-9_]{1,37}", mirror_namespace):
         raise ValueError("Invalid recovery schema name")
     if target == "stage":
@@ -191,6 +201,7 @@ def read_target(spark, config, table, run_id, target, mirror_namespace="public")
 
 def canonical_number(value):
     """Canonical exact decimal representation using Spark expressions only."""
+    # Chỉ thống nhất cách biểu diễn số bằng phép xử lý chuỗi Spark; không ép về float/Decimal giới hạn precision.
     from pyspark.sql import functions as F
 
     value = F.trim(value)
@@ -224,6 +235,7 @@ def canonical_frame(frame, table):
 def reconcile_frames(source, target, table):
     # exceptAll compares complete rows as a multiset, retaining duplicate
     # multiplicity and NULL distinctions. No row contents are printed.
+    # BƯỚC 4: So hai chiều EXCEPT ALL trên đủ cột; giữ số lần lặp và phân biệt NULL, không chỉ so COUNT.
     source_count, target_count = source.count(), target.count()
     left, right = canonical_frame(source, table), canonical_frame(target, table)
     missing = left.exceptAll(right).limit(1).count()

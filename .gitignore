@@ -38,3 +38,6 @@ cdc/sink/fixtures/generated/
 # Local credentials and secrets
 *.pem
 *.key
+
+# Preserve ignore policy for archived local-only E2E source copies
+archive/local-e2e/
