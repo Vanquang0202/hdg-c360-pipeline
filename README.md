@@ -1,120 +1,184 @@
-# HDG: Oracle → Spark / CDC → PostgreSQL
+# HDG — Oracle → PostgreSQL
 
-Ba luồng cần đọc theo thứ tự:
+## 1. Giới thiệu
 
-1. **Sinh dữ liệu:** `generator/seed.py` → Oracle VSS; `changes.py` tạo biến động để kiểm tra CDC.
-2. **Full Load:** `jobs/run_spark.ps1` → `full_load.py` → Oracle snapshot → PostgreSQL Stage → đối soát → publish có bảo vệ.
-3. **CDC:** Oracle → Debezium → Kafka → `cdc/sink/run.py` → PostgreSQL **test**.
+Project xây dựng pipeline đồng bộ dữ liệu hộ gia đình và nhân khẩu từ Oracle VSS sang PostgreSQL. Dữ liệu nguồn gồm bốn bảng: `VSS_HO_GD_NHANKHAU`, `VSS_DM_DANTOC`, `VSS_DM_QUOC_TICH` và `VSS_DM_DBHC`.
 
-Sink chỉ ghi `hdg_cdc_sink_test` tại cổng **55433**, chưa ghi Mirror live ở cổng **55432**. C360/BI/API chưa triển khai.
+Full Load nạp dữ liệu ban đầu bằng Spark/JDBC. CDC dùng Debezium LogMiner đọc thay đổi Oracle, đưa qua Kafka để Sink xử lý. Tầng Mirror giữ nguyên dữ liệu nguồn, không lọc trạng thái hoặc chuẩn hóa nghiệp vụ C360.
 
-## Cấu trúc
+## 2. Kiến trúc
 
 ```text
-generator/          Sinh dữ liệu Oracle và các thao tác thay đổi
-jobs/               Full Load, đối soát, schema và launcher Spark
-sql/                DDL, publisher và SQL phục hồi có bảo vệ
-cdc/                Compose Kafka/Connect và cấu hình Debezium
-  sink/             Đọc Kafka, giải mã và áp giao dịch vào DB test
+Full Load:
+Oracle VSS → Spark JDBC → PostgreSQL Stage → Đối soát → Publish → Mirror
+
+CDC:
+Oracle redo log → Debezium LogMiner → Kafka → Sink prototype → PostgreSQL test
+```
+
+Full Load đọc cả bốn bảng tại cùng một **SCN** — mốc xác định ảnh dữ liệu nhất quán của Oracle. Mỗi lượt nạp có `run_id` riêng, ghi vào Stage rồi so toàn bộ giá trị và số lần xuất hiện của từng dòng với nguồn trước khi publish.
+
+Publisher kiểm schema, audit và trạng thái CDC. Nó chỉ nạp lần đầu khi Mirror rỗng hoặc trả `NOOP` khi nội dung đã giống nhau; không dùng để ghi đè Mirror khác dữ liệu.
+
+Sink hiện đọc các khoảng **Kafka offset** được khai báo trong manifest, chưa chạy như dịch vụ streaming liên tục. Manifest xác định dữ liệu nền, topic và thứ tự giao dịch cần replay. Việc cập nhật bảng test, ghi nhận sự kiện đã xử lý và checkpoint nằm trong cùng transaction PostgreSQL để tránh áp lại sau retry.
+
+Hai bảng có PK được xử lý theo khóa; hai bảng không PK dùng toàn bộ before-image, so sánh cả NULL và chỉ tác động một bản sao. Tombstone không được coi là một lần DELETE thứ hai.
+
+## 3. Cấu trúc thư mục
+
+```text
+generator/          Sinh dữ liệu Oracle và kịch bản biến động
+jobs/               Full Load Spark, đối soát và kiểm schema
+  jars/             Oracle JDBC và PostgreSQL JDBC
+sql/
+  oracle/           DDL bốn bảng nguồn VSS
+  postgres/         DDL Mirror/Stage, publisher và SQL phục hồi
+cdc/                Compose Kafka/Connect, cấu hình Source và LogMiner
+  sink/             Sink prototype và cấu hình PostgreSQL test
 tests/
-  full_load/        Test contract, Stage, Spark, JDBC và integration SQL
-  cdc_sink/         Unit, integration và tiến trình thử crash
-docs/               Bốn file thiết kế gốc, không chỉnh sửa
-archive/            Source đã gộp và tài liệu/bản thử nghiệm cũ
+  full_load/        Kiểm thử schema, Stage, Spark và JDBC
+  cdc_sink/         Kiểm thử decoder, replay, transaction và crash/restart
+docs/               Basic Design và Detail Design
 ```
 
-## 18 file của luồng chính
+Các điểm bắt đầu và module chính:
 
-| File | Dữ liệu đi qua / nhiệm vụ |
+| File | Chức năng |
 |---|---|
-| generator/seed.py | Sinh danh mục và nhân khẩu theo batch; kiểm bốn bảng rỗng trước khi seed |
-| generator/changes.py | Lập kế hoạch INSERT/UPDATE/DELETE/chuyển hộ/đổi mã; chỉ ghi khi có --apply |
-| jobs/run_spark.ps1 | Điểm chạy Spark local[2], chọn Python và classpath JDBC |
-| jobs/full_load.py | Chốt SCN, nạp Stage theo run_id, đối soát rồi publish có điều kiện |
-| jobs/reconcile.py | So dữ liệu Oracle với Stage/Mirror/candidate, không chỉ đếm dòng |
-| jobs/spark_common.py | Kết nối JDBC, vận chuyển số/ngày chính xác, so dữ liệu và ghi audit |
-| jobs/schema_contract.py | Đọc đủ 132 cột từ DDL Oracle; dùng chung cho Full Load và Sink |
-| jobs/schema_preflight.py | Kiểm schema, metadata Stage, PK/FK/default và khả năng digest legacy/v2 |
-| jobs/full_load_guards.sql | Template chặn mất dữ liệu khi cast; bộ sinh nhúng vào publisher |
-| sql/postgres/01_create_mirror_tables.sql | DDL Mirror, Stage và metadata cho database mới |
-| sql/postgres/02_publish_full_load.sql | Publisher atomic, schema guard và audit; không chạy tự động |
-| cdc/sink/run.py | Điểm chạy init/replay/generate-fixture; retry nguyên frame khi lỗi phù hợp |
-| cdc/sink/engine.py | Kiểm baseline/manifest; áp giao dịch cùng inbox, ledger và checkpoint |
-| cdc/sink/protocol.py | Giải mã schema/payload Debezium, kiểm kiểu và phân biệt tombstone |
-| cdc/sink/storage.py | Guard DB test, DDL test và match before-image NULL-safe đúng một bản sao |
-| cdc/sink/kafka_reader.py | Chỉ đọc range offset hữu hạn đã khai báo, không commit/reset Kafka offset |
-| cdc/sink/contract.py | Pin hash DDL và cố định database/port/schema test |
-| cdc/sink/fixtures.py | Sinh dữ liệu synthetic cho lệnh generate-fixture và các bài test |
+| `generator/seed.py` | Sinh dữ liệu bốn bảng theo batch, kiểm số dòng trước khi commit |
+| `generator/changes.py` | Tạo INSERT/UPDATE/DELETE, chuyển hộ, đổi mã và trạng thái |
+| `jobs/run_spark.ps1` | Launcher cho Full Load, đối soát và kiểm JDBC |
+| `jobs/full_load.py` | Đọc snapshot Oracle, ghi Stage, đối soát và gọi publisher |
+| `jobs/reconcile.py` | Đối soát nguồn với Stage, Mirror hoặc Recovery Candidate |
+| `jobs/schema_contract.py` | Mapping 132 cột Oracle sang PostgreSQL, dùng chung với Sink |
+| `jobs/schema_preflight.py` | Kiểm schema và metadata thực tế trước khi ghi |
+| `jobs/spark_common.py` | Kết nối JDBC, vận chuyển kiểu dữ liệu và so sánh toàn dòng |
+| `cdc/compose.yaml`, `cdc/connectors/oracle-source.json` | Cấu hình Kafka, Connect và Oracle Source |
+| `cdc/sink/run.py` | CLI tạo fixture, nạp baseline và replay vào database test |
+| `cdc/sink/engine.py` | Kiểm manifest, áp transaction, chống ghi trùng và cập nhật checkpoint |
+| `cdc/sink/protocol.py`, `storage.py`, `kafka_reader.py` | Giải mã sự kiện, ghi PostgreSQL test và đọc Kafka |
+| `cdc/sink/contract.py`, `fixtures.py` | Contract đích test và dữ liệu synthetic cho kiểm thử |
 
-Giữ decoder, storage và transaction riêng vì mỗi phần kiểm một nhóm điều kiện khác nhau; gộp tiếp sẽ làm Sink khó đọc. SCN xác định ảnh nhất quán Oracle; Kafka offset xác định vị trí sự kiện trong từng partition, không thể thay thế nhau. Checkpoint chỉ tiến cùng transaction PostgreSQL; ledger ngăn áp lại sự kiện sau retry/replay.
+DDL nguồn ở [01_create_source_tables.sql](sql/oracle/01_create_source_tables.sql). PostgreSQL dùng [01_create_mirror_tables.sql](sql/postgres/01_create_mirror_tables.sql) và [02_publish_full_load.sql](sql/postgres/02_publish_full_load.sql). Các file SQL được quản lý bằng `jobs/build_full_load_sql.py` và template `jobs/full_load_guards.sql`.
 
-## Các file hỗ trợ vẫn cần giữ
+## 4. Cấu hình môi trường local
 
-- `jobs/build_full_load_sql.py`: sinh SQL từ contract; `--check` chỉ so file. Giữ cùng `full_load_guards.sql` để không sửa lệch mapping trong từng bản SQL.
-- `sql/oracle/01_create_source_tables.sql`: DDL nguồn, cũng là đầu vào contract. Giữ nguyên byte vì Sink tính hash trên file này.
-- `sql/postgres/03_fix_mirror_contract.sql`, `04_build_recovery_candidate.sql`: giữ cho quy trình phục hồi dữ liệu bị cắt; không tự áp dụng.
-- `cdc/Connect-Network.ps1`, `Invoke-OracleSetup.ps1`, `Register-Source.ps1` và hai SQL trong `cdc/oracle/`: chuẩn bị network, user LogMiner và đăng ký Source cho môi trường mới.
-- `cdc/sink/Setup-Test.ps1`: chuẩn bị DB test; tùy chọn -RunTests có integration, không chạy trong lượt rút gọn.
-- Compose, JSON connector, requirements và `.env.example` là cấu hình cần thiết. Password đọc từ môi trường/`.env`; không đưa secret vào Git.
-- [Yêu cầu gốc](Yeucau_DataPipeline_HGD_C360_4Tuan.md) và bốn file trong `docs/` giữ nguyên. Chi tiết vận hành ở [Full Load](jobs/FULL_LOAD.md), [phục hồi](jobs/FULL_LOAD_RECOVERY.md), [Sink](cdc/sink/PROTOTYPE.md).
+Các lệnh dưới chạy bằng **PowerShell 7**, tại thư mục gốc project. Cần Python 3.11, Java 21 và Docker Desktop cho các dịch vụ local.
 
-## Thứ tự chạy
+| Thành phần | Cấu hình trong project |
+|---|---|
+| Oracle nguồn | Oracle Free, container `hdg-c360-oracle`, service `FREEPDB1`, schema `VSS`, cổng 1521 |
+| PostgreSQL Mirror | PostgreSQL 16, container `hdg-c360-postgres`, database `hdg_mirror`, cổng 55432 |
+| Spark | PySpark 4.0.1, `local[2]`; launcher mặc định dùng `C:\Python311\python.exe` |
+| Kafka | `apache/kafka:3.8.1`; Windows dùng `localhost:29092`, container dùng `kafka:9092` |
+| Kafka Connect | `quay.io/debezium/connect:3.4.3.Final`, REST tại `http://localhost:8083` |
+| PostgreSQL Sink test | Database `hdg_cdc_sink_test`, user `sink_test_owner`, cổng 55433 |
 
-Các lệnh dưới dành cho người vận hành, không phải yêu cầu nạp lại dữ liệu hiện có.
-
-**1. Oracle:** chỉ seed khi bốn bảng nguồn rỗng; cấu hình ORACLE_USER, ORACLE_PASSWORD, ORACLE_DSN theo file mẫu.
+Cài dependency cho generator và Spark, tạo môi trường Python riêng cho Sink:
 
 ```powershell
-python generator/seed.py seed --count 50000 --batch-size 1000
-python generator/seed.py counts
-# Chỉ xem kế hoạch thay đổi, chưa ghi Oracle:
-python generator/changes.py update-info
+C:\Python311\python.exe -m pip install -r generator/requirements.txt -r jobs/requirements-spark.txt
+C:\Python311\python.exe -m venv cdc/sink/.venv
+.\cdc\sink\.venv\Scripts\python.exe -m pip install -r cdc/sink/requirements.txt
 ```
 
-**2. Full Load:** chuẩn bị PySpark 4.0.1, Java 21, jobs/.env và hai JDBC JAR theo FULL_LOAD.md. Với Mirror đang phục hồi, dùng Stage, chưa publish:
+- **Generator:** đọc `ORACLE_USER`, `ORACLE_PASSWORD`, `ORACLE_DSN` từ biến môi trường; không tự đọc .env. DSN local là `localhost:1521/FREEPDB1`.
+- **Spark:** cấu hình theo [jobs/.env.example](jobs/.env.example) trong `jobs/.env` hoặc biến môi trường. Cần `ORACLE_JDBC_URL`, `ORACLE_USER`, `ORACLE_PASSWORD`, `PG_JDBC_URL`, `PG_USER`, `PG_PASSWORD`.
+- **JDBC:** đặt `ojdbc11.jar` và `postgresql-42.7.14.jar` trong `jobs/jars/`. Launcher nạp qua classpath local; Connect cũng mount Oracle JAR này.
+- **CDC Source:** cấu hình `cdc/.env` theo [mẫu](cdc/.env.example), gồm network và `ORACLE_CDC_PASSWORD`. Oracle cần ARCHIVELOG, supplemental logging và tài khoản LogMiner theo `cdc/oracle/`. Helper tạo user đọc password từ biến môi trường PowerShell.
+- **Sink:** password lấy từ `CDC_TEST_PASSWORD` hoặc `cdc/sink/.env.test`. `Setup-Test.ps1` tạo file password nếu chưa có; giữ đúng password của volume test hiện tại.
+
+Không lưu mật khẩu trong source hoặc đưa các file .env vào Git. Oracle và PostgreSQL Mirror phải được chuẩn bị riêng; Compose CDC không tạo lại hai database này.
+
+## 5. Hướng dẫn chạy
+
+### 5.1. Tạo dữ liệu Oracle
+
+Với nguồn mới, tạo schema VSS và bốn bảng bằng DDL nguồn trước. Sau khi thiết lập các biến môi trường Oracle:
 
 ```powershell
+C:\Python311\python.exe generator/seed.py seed --count 50000 --batch-size 1000
+C:\Python311\python.exe generator/seed.py counts
+```
+
+Seed chỉ chạy khi cả bốn bảng rỗng. Nếu đã có dữ liệu, chỉ dùng lệnh counts, không seed lại.
+
+Kịch bản biến động mặc định chỉ in kế hoạch. Thêm --apply khi chủ động muốn ghi thay đổi vào Oracle để kiểm tra CDC:
+
+```powershell
+C:\Python311\python.exe generator/changes.py update-info
+# Ví dụ ghi một thay đổi lên nguồn local:
+# C:\Python311\python.exe generator/changes.py update-info --apply
+```
+
+Các kịch bản khác gồm insert, delete-latest, delete-last, add-household, move-household, change-code, cancel-approval, close-type và approve. delete-last chạy sau delete-latest.
+
+### 5.2. Full Load bằng Spark
+
+Database mới cần cài DDL Mirror/Stage và publisher trước. Database đã có dữ liệu cần theo [hướng dẫn phục hồi](jobs/FULL_LOAD_RECOVERY.md), không chạy lại DDL tạo mới để thay thế dữ liệu.
+
+Kiểm JDBC, nạp vào Stage rồi đối soát snapshot:
+
+```powershell
+.\jobs\run_spark.ps1 -Job check_jdbc
 .\jobs\run_spark.ps1 -Job full_load -JobArguments @("--stage-only")
 .\jobs\run_spark.ps1 -Job reconcile -JobArguments @("--run-id","<RUN_ID>","--target","stage","--source","snapshot")
 ```
 
-Không bỏ --stage-only trước khi đáp ứng quy trình phục hồi và điều kiện publish. Không chạy DDL tạo mới trên database hiện có chỉ để thử.
+Thay <RUN_ID> bằng giá trị trong log Full Load. --stage-only không ghi Mirror. Chỉ chạy full_load không có tùy chọn này khi đáp ứng các điều kiện publisher và quy trình phục hồi; nó tạo một lượt nạp mới, không publish lại Stage cũ.
 
-**3. Debezium/Kafka:** môi trường mới chuẩn bị network, logging/user, cdc/.env, Compose rồi Register-Source.ps1 theo hướng dẫn. Source đã RUNNING thì chỉ xem trạng thái, không đăng ký lại:
+Chi tiết cấu hình, SCN và audit: [FULL_LOAD.md](jobs/FULL_LOAD.md).
+
+### 5.3. Debezium và Kafka
+
+Với môi trường mới, chuẩn bị logging và user LogMiner trước; `cdc/Invoke-OracleSetup.ps1` dùng để tạo user khi chưa tồn tại. Sau đó nối network và khởi động dịch vụ từ các image đã chuẩn bị:
 
 ```powershell
+.\cdc\Connect-Network.ps1
+docker compose --env-file cdc/.env -f cdc/compose.yaml up -d --pull never
+Invoke-RestMethod http://localhost:8083/connector-plugins
+# Chỉ đăng ký khi Source chưa tồn tại:
+.\cdc\Register-Source.ps1
 Invoke-RestMethod http://localhost:8083/connectors/hdg-oracle-observe/status
 ```
 
-**4. Sink test:** dùng venv riêng theo cdc/sink/requirements.txt và manifest với baseline/range đã xác minh:
+Network mặc định là hdg-cdc-net. Register-Source.ps1 kiểm cấu hình và từ chối ghi đè connector đã có. Với Source đang RUNNING, chỉ kiểm tra trạng thái, không đăng ký lại.
+
+Source dùng snapshot.mode=no_data, không tự nạp dữ liệu lịch sử. SCN snapshot và Kafka offset phải được nối tiếp bằng quy trình riêng trước khi dùng CDC cập nhật Mirror.
+
+### 5.4. Sink trên PostgreSQL test
+
+Chuẩn bị PostgreSQL test bằng image postgres:16 đã có:
+
+```powershell
+.\cdc\sink\Setup-Test.ps1
+```
+
+Sink yêu cầu manifest với baseline tương ứng, topic ID, range offset và các transaction frame được khai báo rõ. Với manifest đã kiểm chứng:
 
 ```powershell
 .\cdc\sink\.venv\Scripts\python.exe cdc/sink/run.py init --manifest "<MANIFEST_TEST.json>"
 .\cdc\sink\.venv\Scripts\python.exe cdc/sink/run.py replay --manifest "<MANIFEST_TEST.json>" --kafka-bootstrap localhost:29092
 ```
 
-Địa chỉ Kafka phải khớp listener trong cấu hình đang dùng. Có thể thay --kafka-bootstrap bằng --input "<RECORDS_TEST.jsonl>". Không tự lấy offset 0/latest làm baseline; Source RUNNING với no_data chưa chứng minh cutover an toàn.
+init chỉ nạp baseline vào database test chưa được khởi tạo. Có thể thay --kafka-bootstrap bằng --input "<RECORDS_TEST.jsonl>" để replay file sự kiện. Dữ liệu synthetic dùng cho nhánh file; không dùng manifest synthetic để đọc topic Oracle thật.
 
-## Kiểm tra và trạng thái
+Không tự chọn offset 0/latest làm bằng chứng baseline đã đồng bộ. Hướng dẫn tạo fixture, kiểm thử và giới hạn Sink: [PROTOTYPE.md](cdc/sink/PROTOTYPE.md).
 
-```powershell
-C:\Python311\python.exe -B tests/full_load/test_schema_contract.py
-C:\Python311\python.exe -B tests/full_load/test_stage_only.py
-.\cdc\sink\.venv\Scripts\python.exe -B -m unittest discover -s tests/cdc_sink -p test_unit.py
-C:\Python311\python.exe -B jobs/build_full_load_sql.py --check
-# Kiểm JDBC thủ công vẫn giữ giao diện cũ; file nằm trong tests:
-# .\jobs\run_spark.ps1 -Job check_jdbc
-```
+## 6. Trạng thái hiện tại
 
-Lượt gộp source này: **38 test offline đạt** (9 contract, 12 Stage, 17 Sink), SQL sinh ra khớp template. Không chạy Spark, integration database hoặc E2E.
+**Đã có bằng chứng kiểm thử local:**
 
-Bằng chứng từ các lượt trước: Oracle đã có dữ liệu; Spark Stage/candidate khớp bốn bảng tại SCN 2438031; Source đã phát sự kiện DBHC; Sink synthetic đã kiểm thử trên DB test. Mirror live từng bị cắt chuỗi và chưa được thay bằng candidate. Chưa xác minh cutover barrier, Sink streaming live đa topic hoặc định danh redo qua restart Debezium thật.
+- Oracle có dữ liệu giả lập cho bốn bảng; Spark đã đọc snapshot, ghi Stage và đối soát.
+- Recovery Candidate khớp cả bốn bảng với Oracle tại SCN 2438031; contract v2 và audit SHA256 Stage đã được kiểm chứng.
+- Debezium Source đã chạy và phát INSERT/UPDATE/DELETE cùng tombstone của DBHC.
+- Sink đã kiểm thử với dữ liệu synthetic trên PostgreSQL test, gồm transaction, replay và crash/restart. Bộ offline gồm 9 test contract, 12 test Stage và 17 test Sink đã đạt.
 
-## Những gì đã rút gọn
+**Chưa hoàn thành hoặc cần kiểm chứng tiếp:**
 
-- Gộp `staging_metadata.py` vào `schema_preflight.py`; gộp `manifest.py` vào `engine.py`. Bản gốc giữ nguyên tại `archive/consolidation/`.
-- Chuyển 3 test Full Load và check_jdbc.py sang `tests/full_load/`; chuyển 3 file test Sink sang `tests/cdc_sink/`. Launcher và helper đã cập nhật đường dẫn.
-- Toàn bộ code ngoài archive: **38 → 36 file**. Trong đó **18 file luồng chính + 10 file hỗ trợ + 8 file test/check**. Trước lượt gộp, nhóm luồng chính tương ứng có 20 file.
-- Archive cũ giữ nguyên: 16 bản Python E2E, ba tài liệu lịch sử và README trước lượt rút gọn đầu. Không di chuyển secret, fixture đã sinh, backup hoặc volume.
+- Mirror live vẫn cần phục hồi dữ liệu chuỗi bị cắt; chưa thay bằng Recovery Candidate.
+- Chưa chứng minh ranh giới chuyển tiếp an toàn từ SCN Full Load sang Kafka offset.
+- Sink hiện replay hữu hạn, chưa là dịch vụ streaming live đa topic; định danh sự kiện qua restart Debezium thật cần kiểm chứng.
+- Chưa bật CDC Sink ghi Mirror live; chưa triển khai C360, BI hoặc API.
 
-Việc chuyển test chỉ làm rõ cấu trúc, không làm giảm tổng số file. Không gộp thêm SQL migration/DDL hoặc bỏ guard chỉ để đạt số lượng thấp hơn.
+Các kết quả trên thuộc môi trường local, chưa xác nhận pipeline vận hành hoàn chỉnh.
