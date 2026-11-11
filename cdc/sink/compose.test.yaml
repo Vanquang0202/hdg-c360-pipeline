@@ -1,0 +1,26 @@
+name: hdg-sink-prototype
+services:
+  postgres:
+    image: postgres:16
+    container_name: hdg-cdc-sink-test
+    ports:
+      - "127.0.0.1:55433:5432"
+    environment:
+      POSTGRES_DB: hdg_cdc_sink_test
+      POSTGRES_USER: sink_test_owner
+      POSTGRES_PASSWORD: ${CDC_TEST_PASSWORD:?Set test password in .env.test}
+    command: ["postgres","-c","shared_buffers=32MB","-c","max_connections=12"]
+    mem_limit: 256m
+    cpus: 0.75
+    volumes:
+      - prototype_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL","pg_isready -U sink_test_owner -d hdg_cdc_sink_test"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+    logging:
+      driver: json-file
+      options: {max-size: "5m", max-file: "2"}
+volumes:
+  prototype_pgdata:

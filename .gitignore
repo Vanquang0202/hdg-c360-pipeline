@@ -20,3 +20,24 @@ test-results/
 *.csv
 *.parquet
 
+
+# Local database backups and sensitive artifacts
+backups/
+*.dump
+*.backup
+*.sql.gz
+
+# Local-only E2E sink copies
+cdc/sink-kafka-e2e/
+cdc/sink-dantoc-e2e/
+
+# Local test manifests and generated fixtures
+cdc/sink/kafka-*-e2e-manifest.json
+cdc/sink/fixtures/generated/
+
+# Local credentials and secrets
+*.pem
+*.key
+
+# Preserve ignore policy for archived local-only E2E source copies
+archive/local-e2e/
