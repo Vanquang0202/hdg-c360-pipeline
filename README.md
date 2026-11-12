@@ -1,123 +1,62 @@
-# HDG — Oracle → PostgreSQL
+# HDG → Mirror → C360
 
-## 1. Giới thiệu
+Pipeline local đồng bộ bốn bảng Oracle VSS sang PostgreSQL, rồi chuẩn hóa mỗi công dân thành một dòng C360. Mirror giữ nguyên dữ liệu nguồn; lọc nghiệp vụ và DQ_FLAGS chỉ thực hiện ở C360.
 
-Project xây dựng pipeline đồng bộ dữ liệu hộ gia đình và nhân khẩu từ Oracle VSS sang PostgreSQL. Dữ liệu nguồn gồm bốn bảng: `VSS_HO_GD_NHANKHAU`, `VSS_DM_DANTOC`, `VSS_DM_QUOC_TICH` và `VSS_DM_DBHC`.
-
-Full Load nạp dữ liệu ban đầu bằng Spark/JDBC. CDC dùng Debezium LogMiner đọc thay đổi Oracle, đưa qua Kafka để Sink xử lý. Tầng Mirror giữ nguyên dữ liệu nguồn, không lọc trạng thái hoặc chuẩn hóa nghiệp vụ C360.
-
-## 2. Kiến trúc
+## Luồng xử lý
 
 ```text
-Full Load:
-Oracle VSS → Spark JDBC → PostgreSQL Stage → Đối soát → Publish → Mirror
-
-CDC:
-Oracle redo log → Debezium LogMiner → Kafka → Sink prototype → PostgreSQL test
+Oracle → Spark/JDBC → Stage → đối soát → publisher/cutover → Mirror
+Oracle redo → Debezium → Kafka → Sink transaction + checkpoint → Mirror
+Mirror → Map + lọc/chọn đại diện/chuẩn hóa → Stage → publish → C360
+Mirror → trigger enqueue → Change Queue → worker incremental → C360
 ```
 
-Full Load đọc cả bốn bảng tại cùng một **SCN** — mốc xác định ảnh dữ liệu nhất quán của Oracle. Mỗi lượt nạp có `run_id` riêng, ghi vào Stage rồi so toàn bộ giá trị và số lần xuất hiện của từng dòng với nguồn trước khi publish.
+Sink hiện replay theo manifest hữu hạn, chưa là dịch vụ Kafka streaming liên tục. Worker C360 chỉ đánh giá lại MA_CD bị ảnh hưởng, ACK Queue cùng transaction với dữ liệu và log.
 
-Publisher kiểm schema, audit và trạng thái CDC. Nó chỉ nạp lần đầu khi Mirror rỗng hoặc trả `NOOP` khi nội dung đã giống nhau; không dùng để ghi đè Mirror khác dữ liệu.
+## Đọc source từ đâu?
 
-Sink hiện đọc các khoảng **Kafka offset** được khai báo trong manifest, chưa chạy như dịch vụ streaming liên tục. Manifest xác định dữ liệu nền, topic và thứ tự giao dịch cần replay. Việc cập nhật bảng test, ghi nhận sự kiện đã xử lý và checkpoint nằm trong cùng transaction PostgreSQL để tránh áp lại sau retry.
-
-Hai bảng có PK được xử lý theo khóa; hai bảng không PK dùng toàn bộ before-image, so sánh cả NULL và chỉ tác động một bản sao. Tombstone không được coi là một lần DELETE thứ hai.
-
-## 3. Cấu trúc thư mục
-
-```text
-generator/          Sinh dữ liệu Oracle và kịch bản biến động
-jobs/               Full Load Spark, đối soát và kiểm schema
-  jars/             Oracle JDBC và PostgreSQL JDBC
-sql/
-  oracle/           DDL bốn bảng nguồn VSS
-  postgres/         DDL Mirror/Stage, publisher và SQL phục hồi
-cdc/                Compose Kafka/Connect, cấu hình Source và LogMiner
-  sink/             Sink prototype và cấu hình PostgreSQL test
-tests/
-  full_load/        Kiểm thử schema, Stage, Spark và JDBC
-  cdc_sink/         Kiểm thử decoder, replay, transaction và crash/restart
-docs/               Basic Design và Detail Design
-```
-
-Các điểm bắt đầu và module chính:
-
-| File | Chức năng |
+| Thành phần | Entrypoint và module |
 |---|---|
-| `generator/seed.py` | Sinh dữ liệu bốn bảng theo batch, kiểm số dòng trước khi commit |
-| `generator/changes.py` | Tạo INSERT/UPDATE/DELETE, chuyển hộ, đổi mã và trạng thái |
-| `jobs/run_spark.ps1` | Launcher cho Full Load, đối soát và kiểm JDBC |
-| `jobs/full_load.py` | Đọc snapshot Oracle, ghi Stage, đối soát và gọi publisher |
-| `jobs/reconcile.py` | Đối soát nguồn với Stage, Mirror hoặc Recovery Candidate |
-| `jobs/schema_contract.py` | Mapping 132 cột Oracle sang PostgreSQL, dùng chung với Sink |
-| `jobs/schema_preflight.py` | Kiểm schema và metadata thực tế trước khi ghi |
-| `jobs/spark_common.py` | Kết nối JDBC, vận chuyển kiểu dữ liệu và so sánh toàn dòng |
-| `cdc/compose.yaml`, `cdc/connectors/oracle-source.json` | Cấu hình Kafka, Connect và Oracle Source |
-| `cdc/sink/run.py` | CLI tạo fixture, nạp baseline và replay vào database test |
-| `cdc/sink/engine.py` | Kiểm manifest, áp transaction, chống ghi trùng và cập nhật checkpoint |
-| `cdc/sink/protocol.py`, `storage.py`, `kafka_reader.py` | Giải mã sự kiện, ghi PostgreSQL test và đọc Kafka |
-| `cdc/sink/contract.py`, `fixtures.py` | Contract đích test và dữ liệu synthetic cho kiểm thử |
+| Dữ liệu Oracle local | `generator/seed.py`, `generator/changes.py` |
+| Full Load Oracle → Mirror | `jobs/run_spark.ps1` → `full_load.py`; `reconcile.py` đối soát |
+| Hợp đồng dữ liệu | `jobs/schema_contract.py`, `schema_preflight.py`, `spark_common.py`: 132 cột, kiểu dữ liệu và kiểm tra trước khi ghi |
+| CDC Source | `cdc/compose.yaml`, `Register-Source.ps1`, `connectors/oracle-source.json`; `cdc/oracle/` chứa preflight/quyền LogMiner |
+| CDC Sink và phục hồi | `cdc/sink/cutover.py`: prepare/apply/extend/replay/rollback; `run.py` là CLI test |
+| Module Sink | `protocol.py` giải mã; `engine.py` áp giao dịch/idempotency; `storage.py` kiểm guard và SQL; `kafka_reader.py` đọc range; `contract.py` và `fixtures.py` cung cấp contract/schema dùng chung |
+| Full và incremental C360 | `jobs/c360_full_load.py`: normalize, staging/publish, trigger contract, Queue và worker dùng chung logic |
+| SQL | `sql/oracle/`: nguồn; `sql/postgres/`: Mirror/Stage, publisher, recovery, C360 và enqueue |
+| Kiểm thử | `tests/full_load/`: schema/Stage/transport; `tests/cdc_sink/`: transaction/replay/crash/cutover/E2E; `tests/test_c360*.py`: chuẩn hóa và incremental |
+| Yêu cầu và Data Model | `Yeucau_DataPipeline_HGD_C360_4Tuan.md`, `docs/` |
 
-DDL nguồn ở [01_create_source_tables.sql](sql/oracle/01_create_source_tables.sql). PostgreSQL dùng [01_create_mirror_tables.sql](sql/postgres/01_create_mirror_tables.sql) và [02_publish_full_load.sql](sql/postgres/02_publish_full_load.sql). Các file SQL được quản lý bằng `jobs/build_full_load_sql.py` và template `jobs/full_load_guards.sql`.
+Giữ riêng các module contract, guard và transaction để dễ kiểm tra ranh giới an toàn; không bỏ qua chúng khi chạy job.
 
-## 4. Cấu hình môi trường local
+## Cấu hình local
 
-Các lệnh dưới chạy bằng **PowerShell 7**, tại thư mục gốc project. Cần Python 3.11, Java 21 và Docker Desktop cho các dịch vụ local.
+- Oracle: `localhost:1521/FREEPDB1`, schema `VSS`.
+- PostgreSQL Mirror/C360: `localhost:15432/hdg_mirror`; PostgreSQL test: `localhost:15433`.
+- Kafka host: `localhost:29092`; trong container: `kafka:9092`. Connect REST: `localhost:8083`.
+- Python 3.11, Java 21, PySpark 4.0.1. Launcher Spark mặc định `C:\Python311\python.exe`.
+- JAR local: `jobs/jars/ojdbc11.jar`, `postgresql-42.7.14.jar`; dùng classpath, không phân phối bằng `--jars` trên local Windows.
 
-| Thành phần | Cấu hình trong project |
-|---|---|
-| Oracle nguồn | Oracle Free, container `hdg-c360-oracle`, service `FREEPDB1`, schema `VSS`, cổng 1521 |
-| PostgreSQL Mirror | PostgreSQL 16, container `hdg-c360-postgres`, database `hdg_mirror`, cổng 15432 |
-| Spark | PySpark 4.0.1, `local[2]`; launcher mặc định dùng `C:\Python311\python.exe` |
-| Kafka | `apache/kafka:3.8.1`; Windows dùng `localhost:29092`, container dùng `kafka:9092` |
-| Kafka Connect | `quay.io/debezium/connect:3.4.3.Final`, REST tại `http://localhost:8083` |
-| PostgreSQL Sink test | Database `hdg_cdc_sink_test`, user `sink_test_owner`, cổng 15433 |
+Dependency theo môi trường nằm trong `generator/requirements.txt`, `jobs/requirements-spark.txt`, `cdc/sink/requirements.txt`. Sink/C360 dùng Python trong `cdc/sink/.venv`.
 
-Cài dependency cho generator và Spark, tạo môi trường Python riêng cho Sink:
+Spark/C360 đọc `jobs/.env` hoặc biến môi trường theo [mẫu](jobs/.env.example). Generator đọc `ORACLE_USER`, `ORACLE_PASSWORD`, `ORACLE_DSN` từ môi trường. CDC dùng `cdc/.env`; PostgreSQL test dùng `cdc/sink/.env.test`. Không đưa mật khẩu, JAR hoặc dữ liệu vào Git. Oracle/PostgreSQL hiện có được tái sử dụng, không tạo lại volumes.
 
-```powershell
-C:\Python311\python.exe -m pip install -r generator/requirements.txt -r jobs/requirements-spark.txt
-C:\Python311\python.exe -m venv cdc/sink/.venv
-.\cdc\sink\.venv\Scripts\python.exe -m pip install -r cdc/sink/requirements.txt
-```
+## Thứ tự chạy
 
-- **Generator:** đọc `ORACLE_USER`, `ORACLE_PASSWORD`, `ORACLE_DSN` từ biến môi trường; không tự đọc .env. DSN local là `localhost:1521/FREEPDB1`.
-- **Spark:** cấu hình theo [jobs/.env.example](jobs/.env.example) trong `jobs/.env` hoặc biến môi trường. Cần `ORACLE_JDBC_URL`, `ORACLE_USER`, `ORACLE_PASSWORD`, `PG_JDBC_URL`, `PG_USER`, `PG_PASSWORD`.
-- **JDBC:** đặt `ojdbc11.jar` và `postgresql-42.7.14.jar` trong `jobs/jars/`. Launcher nạp qua classpath local; Connect cũng mount Oracle JAR này.
-- **CDC Source:** cấu hình `cdc/.env` theo [mẫu](cdc/.env.example), gồm network và `ORACLE_CDC_PASSWORD`. Oracle cần ARCHIVELOG, supplemental logging và tài khoản LogMiner theo `cdc/oracle/`. Helper tạo user đọc password từ biến môi trường PowerShell.
-- **Sink:** password lấy từ `CDC_TEST_PASSWORD` hoặc `cdc/sink/.env.test`. `Setup-Test.ps1` tạo file password nếu chưa có; giữ đúng password của volume test hiện tại.
+Các lệnh chạy bằng PowerShell tại gốc project. Chỉ chạy bước thiết lập khi môi trường chưa có; không seed/reset database đang giữ dữ liệu.
 
-Không lưu mật khẩu trong source hoặc đưa các file .env vào Git. Oracle và PostgreSQL Mirror phải được chuẩn bị riêng; Compose CDC không tạo lại hai database này.
-
-## 5. Hướng dẫn chạy
-
-### 5.1. Tạo dữ liệu Oracle
-
-Với nguồn mới, tạo schema VSS và bốn bảng bằng DDL nguồn trước. Sau khi thiết lập các biến môi trường Oracle:
+### 1. Oracle giả lập
 
 ```powershell
 C:\Python311\python.exe generator/seed.py seed --count 50000 --batch-size 1000
 C:\Python311\python.exe generator/seed.py counts
-```
-
-Seed chỉ chạy khi cả bốn bảng rỗng. Nếu đã có dữ liệu, chỉ dùng lệnh counts, không seed lại.
-
-Kịch bản biến động mặc định chỉ in kế hoạch. Thêm --apply khi chủ động muốn ghi thay đổi vào Oracle để kiểm tra CDC:
-
-```powershell
 C:\Python311\python.exe generator/changes.py update-info
-# Ví dụ ghi một thay đổi lên nguồn local:
-# C:\Python311\python.exe generator/changes.py update-info --apply
 ```
 
-Các kịch bản khác gồm insert, delete-latest, delete-last, add-household, move-household, change-code, cancel-approval, close-type và approve. delete-last chạy sau delete-latest.
+Seed chỉ chấp nhận cả bốn bảng rỗng. `changes.py` mặc định xem kế hoạch; `--apply` mới ghi fixture nguồn.
 
-### 5.2. Full Load bằng Spark
-
-Database mới cần cài DDL Mirror/Stage và publisher trước. Database đã có dữ liệu cần theo [hướng dẫn phục hồi](jobs/FULL_LOAD_RECOVERY.md), không chạy lại DDL tạo mới để thay thế dữ liệu.
-
-Kiểm JDBC, nạp vào Stage rồi đối soát snapshot:
+### 2. Full Load Oracle → Mirror
 
 ```powershell
 .\jobs\run_spark.ps1 -Job check_jdbc
@@ -125,60 +64,56 @@ Kiểm JDBC, nạp vào Stage rồi đối soát snapshot:
 .\jobs\run_spark.ps1 -Job reconcile -JobArguments @("--run-id","<RUN_ID>","--target","stage","--source","snapshot")
 ```
 
-Thay <RUN_ID> bằng giá trị trong log Full Load. --stage-only không ghi Mirror. Chỉ chạy full_load không có tùy chọn này khi đáp ứng các điều kiện publisher và quy trình phục hồi; nó tạo một lượt nạp mới, không publish lại Stage cũ.
+Stage-only chưa thay Mirror. Publisher hỗ trợ bootstrap/NOOP; thay baseline live phải qua cutover có fence, backup và checkpoint handoff. Không suy barrier từ SCN hoặc Kafka end offset đơn lẻ. Hướng dẫn DDL, migration và rollback: [FULL_LOAD.md](jobs/FULL_LOAD.md).
 
-Chi tiết cấu hình, SCN và audit: [FULL_LOAD.md](jobs/FULL_LOAD.md).
-
-### 5.3. Debezium và Kafka
-
-Với môi trường mới, chuẩn bị logging và user LogMiner trước; `cdc/Invoke-OracleSetup.ps1` dùng để tạo user khi chưa tồn tại. Sau đó nối network và khởi động dịch vụ từ các image đã chuẩn bị:
+### 3. CDC Oracle → Kafka → Mirror
 
 ```powershell
 .\cdc\Connect-Network.ps1
 docker compose --env-file cdc/.env -f cdc/compose.yaml up -d --pull never
-Invoke-RestMethod http://localhost:8083/connector-plugins
-# Chỉ đăng ký khi Source chưa tồn tại:
-.\cdc\Register-Source.ps1
 Invoke-RestMethod http://localhost:8083/connectors/hdg-oracle-observe/status
+# Chỉ khi Source chưa tồn tại và Oracle đã đủ quyền/logging:
+# .\cdc\Register-Source.ps1
 ```
 
-Network mặc định là hdg-cdc-net. Register-Source.ps1 kiểm cấu hình và từ chối ghi đè connector đã có. Với Source đang RUNNING, chỉ kiểm tra trạng thái, không đăng ký lại.
-
-Source dùng snapshot.mode=no_data, không tự nạp dữ liệu lịch sử. SCN snapshot và Kafka offset phải được nối tiếp bằng quy trình riêng trước khi dùng CDC cập nhật Mirror.
-
-### 5.4. Sink trên PostgreSQL test
-
-Chuẩn bị PostgreSQL test bằng image postgres:16 đã có:
+Đọc thay đổi vào Mirror live bằng plan/extension đã kiểm chứng:
 
 ```powershell
-.\cdc\sink\Setup-Test.ps1
+$py = ".\cdc\sink\.venv\Scripts\python.exe"
+& $py cdc/sink/cutover.py extend --plan "<ACTIVE_PLAN.json>" --extension "<VERIFIED_EXTENSION.json>" --confirm-database hdg_mirror
+& $py cdc/sink/cutover.py replay --plan "<VERIFIED_EXTENSION.json>" --confirm-database hdg_mirror
 ```
 
-Sink yêu cầu manifest với baseline tương ứng, topic ID, range offset và các transaction frame được khai báo rõ. Với manifest đã kiểm chứng:
+Không init lại baseline/epoch hiện có. `run.py init/replay` dành cho database test và baseline tương ứng, không dùng để ghi live.
+
+### 4. Mirror → C360
 
 ```powershell
-.\cdc\sink\.venv\Scripts\python.exe cdc/sink/run.py init --manifest "<MANIFEST_TEST.json>"
-.\cdc\sink\.venv\Scripts\python.exe cdc/sink/run.py replay --manifest "<MANIFEST_TEST.json>" --kafka-bootstrap localhost:29092
+# Chỉ cài một lần khi schema c360 chưa tồn tại:
+# & $py jobs/c360_full_load.py install
+& $py jobs/c360_full_load.py full
+# Chỉ bật sau kiểm thử độc lập và guard đạt:
+# & $py jobs/c360_full_load.py enable-nrt
+& $py jobs/c360_full_load.py worker --watch --interval 15 --batch-size 500
 ```
 
-init chỉ nạp baseline vào database test chưa được khởi tạo. Có thể thay --kafka-bootstrap bằng --input "<RECORDS_TEST.jsonl>" để replay file sự kiện. Dữ liệu synthetic dùng cho nhánh file; không dùng manifest synthetic để đọc topic Oracle thật.
+Chỉ chạy một watcher. Full/NRT dùng chung Control; trigger chỉ enqueue, worker giữ đúng tập ID khi ACK và retry. Chi tiết UNKNOWN, test và vận hành: [C360.md](jobs/C360.md).
 
-Không tự chọn offset 0/latest làm bằng chứng baseline đã đồng bộ. Hướng dẫn tạo fixture, kiểm thử và giới hạn Sink: [PROTOTYPE.md](cdc/sink/PROTOTYPE.md).
+## Kiểm thử và trạng thái
 
-## 6. Trạng thái hiện tại
+Kiểm tra không ghi database:
 
-**Đã có bằng chứng kiểm thử local:**
+```powershell
+C:\Python311\python.exe -B tests/full_load/test_schema_contract.py
+C:\Python311\python.exe -B tests/full_load/test_spark_transport.py
+& $py -B -m unittest discover -s tests/cdc_sink -p test_unit.py
+$env:PYTHONPATH = "tests"
+& $py -B -m unittest test_c360.Rules
+C:\Python311\python.exe -B jobs/build_full_load_sql.py --check
+```
 
-- Oracle có dữ liệu giả lập cho bốn bảng; Spark đã đọc snapshot, ghi Stage và đối soát.
-- Recovery Candidate khớp cả bốn bảng với Oracle tại SCN 2438031; contract v2 và audit SHA256 Stage đã được kiểm chứng.
-- Debezium Source đã chạy và phát INSERT/UPDATE/DELETE cùng tombstone của DBHC.
-- Sink đã kiểm thử với dữ liệu synthetic trên PostgreSQL test, gồm transaction, replay và crash/restart. Bộ offline gồm 9 test contract, 12 test Stage và 17 test Sink đã đạt.
+Các integration/E2E cần môi trường riêng và có ghi dữ liệu thử. Không chạy tự động trên database đang giữ bằng chứng PASS; test Sink cũ có reset fixture. Test NRT tạo database mới. Không dùng `discover` toàn bộ rồi coi các test SKIP là PASS.
 
-**Chưa hoàn thành hoặc cần kiểm chứng tiếp:**
+Đã có bằng chứng local cho Full Load/cutover Mirror, CDC bốn bảng, Full C360 **48.747 công dân** và incremental/rollback/replay trên database độc lập. Các bằng chứng máy local nằm trong `test-results/` được Git ignore.
 
-- Mirror live vẫn cần phục hồi dữ liệu chuỗi bị cắt; chưa thay bằng Recovery Candidate.
-- Chưa chứng minh ranh giới chuyển tiếp an toàn từ SCN Full Load sang Kafka offset.
-- Sink hiện replay hữu hạn, chưa là dịch vụ streaming live đa topic; định danh sự kiện qua restart Debezium thật cần kiểm chứng.
-- Chưa bật CDC Sink ghi Mirror live; chưa triển khai C360, BI hoặc API.
-
-Các kết quả trên thuộc môi trường local, chưa xác nhận pipeline vận hành hoàn chỉnh.
+Chưa hoàn tất: Sink streaming liên tục; chính sách khoảng năm sinh và chuyển đổi điện thoại còn UNKNOWN; worker dừng khi danh mục đổi để tránh dùng Map cũ. Chưa triển khai BI/API. Watcher local chưa tự khởi động cùng Windows.

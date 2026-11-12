@@ -26,14 +26,43 @@ from engine import initialize, validate, check_records, apply_frame, transaction
 from protocol import loads, decode, digest, Rejected
 from fixtures import row_schema
 from kafka_reader import read_ranges
-from local_remaining_e2e import metadata, dump
-from confluent_kafka import Consumer
+from confluent_kafka import Consumer, TopicPartition, TopicCollection, KafkaException
 from confluent_kafka.admin import AdminClient
 from psycopg import sql
 from dotenv import dotenv_values
 
 PREFIX = "hdg_observe"
 PYTHON = r"C:\Python311\python.exe"
+
+
+
+def metadata(admin, consumer):
+    found = admin.list_topics(timeout=10)
+    names = [PREFIX + ".VSS." + name for name in contract.TABLES] + [PREFIX + ".transaction"]
+    existing = [name for name in names if name in found.topics]
+    futures = admin.describe_topics(TopicCollection(existing))
+    result = {}
+    for name in names:
+        if name not in found.topics:
+            result[name] = dict(topic=name, topic_id="UNUSED-EMPTY-TEST-STREAM",
+                                partition=0, start=0, end=0, exists=False)
+            continue
+        assert set(found.topics[name].partitions) == {0}, "Only partition 0 supported"
+        # Topic mới có thể chưa có leader ngay; chỉ retry metadata, không tạo lại DML.
+        for retry in range(5):
+            try:
+                low, high = consumer.get_watermark_offsets(TopicPartition(name, 0), timeout=10)
+                break
+            except KafkaException:
+                if retry == 4:
+                    raise
+                time.sleep(1)
+        result[name] = dict(topic=name, topic_id=str(futures[name].result(timeout=10).topic_id),
+                            partition=0, start=low, end=high, exists=True)
+    return result
+
+def dump(path, data):
+    path.write_text(json.dumps(data, ensure_ascii=True, indent=2), encoding="utf-8")
 
 
 def api(suffix):

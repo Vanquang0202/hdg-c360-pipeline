@@ -1,5 +1,0 @@
-.env.test
-.venv/
-__pycache__/
-fixtures/generated/
-test-results/
