@@ -160,6 +160,9 @@ def locks(connection):
     connection.execute("SET LOCAL statement_timeout='180s'")
     connection.execute("SELECT pg_advisory_xact_lock(784027,1)")
     connection.execute("SELECT pg_advisory_xact_lock(631874,1)")
+    # Control trước Mirror, cùng thứ tự worker C360, tránh deadlock khi cutover chờ NRT.
+    if connection.execute("SELECT to_regclass('c360.c360_sync_control')").fetchone()[0] is not None:
+        connection.execute("SELECT control_key FROM c360.c360_sync_control WHERE control_key='NORMALIZE' FOR UPDATE")
     for t in TABLES.values():
         connection.execute(sql.SQL("LOCK TABLE {} IN ACCESS EXCLUSIVE MODE").format(storage.relation(t)))
 
@@ -192,6 +195,7 @@ def safe_schema(connection):
             "+(SELECT count(*) FROM pg_constraint WHERE contype='f' AND (conrelid=%s::regclass OR confrelid=%s::regclass))"
             "+(SELECT count(*) FROM pg_class WHERE oid=%s::regclass AND (relrowsecurity OR relforcerowsecurity))",
             ("public."+t["mirror"],)*4).fetchone()[0]
+        unsafe -= storage.allowed_c360_trigger(connection,"public."+t["mirror"])
         require(unsafe == 0,"CUTOVER_HAS_UNSUPPORTED_TRIGGER_FK_RLS")
 
 
