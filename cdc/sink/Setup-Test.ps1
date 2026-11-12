@@ -40,7 +40,7 @@ if (-not $healthy) { throw "Test PostgreSQL did not become healthy" }
 Write-Host "Only hdg-cdc-sink-test prepared at localhost:15433."
 # BƯỚC 4: Test chỉ định rõ DB test; integration có reset fixture nên không tự chạy ở lượt rút gọn source.
 if ($RunTests) {
-    if (-not (Test-Path -LiteralPath $python)) { throw "Install the project-local venv first; see PROTOTYPE.md" }
+    if (-not (Test-Path -LiteralPath $python)) { throw "Install the project-local venv first; see jobs/FULL_LOAD.md" }
     Push-Location $project
     try {
         & $python -B -m unittest discover -s tests/cdc_sink -p test_unit.py -v

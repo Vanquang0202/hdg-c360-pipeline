@@ -41,3 +41,7 @@ cdc/sink/fixtures/generated/
 
 # Preserve ignore policy for archived local-only E2E source copies
 archive/local-e2e/
+
+# Local historical copies and JDBC artifacts
+/archive/
+/jobs/**/jars/
