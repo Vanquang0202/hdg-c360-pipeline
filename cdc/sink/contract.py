@@ -13,6 +13,6 @@ from schema_contract import source_schema, pg_catalog_type  # noqa: E402
 TABLES = source_schema()
 CONTRACT_HASH = hashlib.sha256((ROOT / "sql/oracle/01_create_source_tables.sql").read_bytes()).hexdigest()
 DATABASE = "hdg_cdc_sink_test"
-PORT = 55433
+PORT = 15433
 MIRROR_SCHEMA = "mirror_test"
 META_SCHEMA = "sink_meta"

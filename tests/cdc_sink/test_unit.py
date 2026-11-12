@@ -10,7 +10,7 @@ from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 # Nạp module runtime ở vị trí gốc; test không chứa bản sao code Sink.
 sys.path.insert(0,str(Path(__file__).resolve().parents[2] / "cdc/sink"))
@@ -30,6 +30,83 @@ def number_column(oracle="NUMBER"):
 
 class ProtocolTests(unittest.TestCase):
     # Kiểm decoder, replay, guard và Kafka reader giả lập; không cần kết nối hệ thống.
+    def stage_document(self):
+        b = Builder()
+        document = b.document()
+        document["baseline"].update(kind="spark-stage-v2", run_id="11111111-1111-4111-8111-111111111111")
+        for spec in document["baseline"]["tables"].values():
+            spec.pop("rows")
+            spec.update(row_count=0, stage_digest="0"*64)
+        return document
+
+    def test_stage_baseline_reference_validates_without_embedding_rows(self):
+        self.assertEqual(validate(self.stage_document())["baseline"]["kind"], "spark-stage-v2")
+
+    def test_stage_baseline_rejects_bad_digest_or_count(self):
+        for field, value in [("stage_digest", "bad"), ("row_count", -1)]:
+            document = self.stage_document()
+            next(iter(document["baseline"]["tables"].values()))[field] = value
+            with self.assertRaises(Rejected):
+                validate(document)
+
+    def test_stage_baseline_cannot_also_embed_unverified_rows(self):
+        document = self.stage_document()
+        next(iter(document["baseline"]["tables"].values()))["rows"] = []
+        with self.assertRaisesRegex(Rejected, "STAGE_BASELINE_MUST_REFERENCE_AUDIT"):
+            validate(document)
+
+    def test_cutover_scope_keeps_default_live_endpoint_blocked(self):
+        from storage import cutover_target, assert_endpoint
+        connection = SimpleNamespace(info=SimpleNamespace(dbname="hdg_mirror", host="127.0.0.1",
+                                                           port=15432, user="hdg_user"))
+        with self.assertRaises(ValueError):
+            assert_endpoint(connection)
+        with self.assertRaises(ValueError):
+            with cutover_target(connection, "hdg_mirror", "hdg_mirror", "live"):
+                pass
+
+    def test_clone_scope_never_allows_test_reset(self):
+        from storage import cutover_target, reset_test_fixture
+        connection = SimpleNamespace(info=SimpleNamespace(dbname="hdg_cutover_clone_1234abcd_test",
+                                       host="127.0.0.1", port=15432, user="hdg_user"), execute=Mock())
+        with cutover_target(connection, connection.info.dbname, connection.info.dbname):
+            with self.assertRaises(ValueError):
+                reset_test_fixture(connection)
+        connection.execute.assert_not_called()
+
+    def test_cutover_plan_rejects_relabelled_test_as_live(self):
+        from cutover import validate_plan
+        plan = dict(format="hdg-cutover-v1", id="11111111-1111-4111-8111-111111111111",
+                    purpose="live-recovery", target=dict(database="hdg_mirror",host="127.0.0.1",port=15432),
+                    run_id="11111111-1111-4111-8111-111111111111",
+                    manifest=dict(mode="cutover-live",baseline=dict(kind="spark-stage-v2",
+                                  run_id="11111111-1111-4111-8111-111111111111")))
+        with self.assertRaisesRegex(Rejected, "FRESH_LIVE_BARRIER_REQUIRED"):
+            validate_plan(plan)
+
+    def test_cutover_append_cannot_replace_applied_frames(self):
+        from cutover import extend
+        old=dict(id="x",target={},purpose="clone",manifest=dict(baseline={},streams=[],frames=[{"old":1}]))
+        new=copy.deepcopy(old)
+        new["manifest"]["frames"]=[{"changed":1},{"new":2}]
+        with self.assertRaisesRegex(Rejected,"EXTENSION_PREFIX"):
+            extend(Mock(),old,new)
+
+    def test_cutover_append_validates_complete_transaction_before_metadata(self):
+        from cutover import extend
+        b=Builder()
+        b.transaction([("VSS_DM_DBHC","c",None,image("VSS_DM_DBHC"))])
+        old=dict(id="x",target={},purpose="clone",manifest=b.document())
+        b.transaction([("VSS_DM_DBHC","c",None,image("VSS_DM_DBHC",id=Decimal(2)))])
+        new=copy.deepcopy(old)
+        new["manifest"]=b.document()
+        new["manifest"]["frames"][-1]["event_count"]=2
+        connection=Mock()
+        with patch("cutover.read_ranges",return_value=b.records):
+            with self.assertRaisesRegex(Rejected,"TRANSACTION_EVENT_COUNT"):
+                extend(connection,old,new)
+        connection.execute.assert_not_called()
+
     def test_all_132_contract_columns_and_full_schemas(self):
         self.assertEqual(sum(len(t["columns"]) for t in TABLES.values()),132)
         for source,table in TABLES.items():
@@ -169,7 +246,7 @@ class ProtocolTests(unittest.TestCase):
 
     def test_endpoint_guard_rejects_live_before_any_sql(self):
         connection=MagicMock()
-        connection.info=SimpleNamespace(dbname="hdg_mirror",host="127.0.0.1",port=55432,user="postgres")
+        connection.info=SimpleNamespace(dbname="hdg_mirror",host="127.0.0.1",port=15432,user="postgres")
         with self.assertRaises(ValueError):
             bootstrap(connection)
         connection.execute.assert_not_called()

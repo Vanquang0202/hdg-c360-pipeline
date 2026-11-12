@@ -1,4 +1,4 @@
-# Mục đích: Kiểm tính nguyên tử/replay trên database test cố định cổng 55433.
+# Mục đích: Kiểm tính nguyên tử/replay trên database test cố định cổng 15433.
 # Đầu vào: PostgreSQL test và synthetic events, không phải Mirror live.
 # Đầu ra: Kết quả integration; mỗi ca chỉ reset các bảng fixture riêng của prototype.
 """Real PostgreSQL integration suite. Fixed separate container/database/port only."""

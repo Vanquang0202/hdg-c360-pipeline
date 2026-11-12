@@ -4,7 +4,7 @@ services:
     image: postgres:16
     container_name: hdg-cdc-sink-test
     ports:
-      - "127.0.0.1:55433:5432"
+      - "127.0.0.1:15433:5432"
     environment:
       POSTGRES_DB: hdg_cdc_sink_test
       POSTGRES_USER: sink_test_owner

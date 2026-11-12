@@ -31,7 +31,7 @@ def settings():
         "oracle_user": os.environ.get("ORACLE_USER", "VSS"),
         "oracle_password": os.environ.get("ORACLE_PASSWORD"),
         "pg_url": os.environ.get(
-            "PG_JDBC_URL", "jdbc:postgresql://localhost:55432/hdg_mirror"),
+            "PG_JDBC_URL", "jdbc:postgresql://localhost:15432/hdg_mirror"),
         "pg_user": os.environ.get("PG_USER"),
         "pg_password": os.environ.get("PG_PASSWORD"),
     }

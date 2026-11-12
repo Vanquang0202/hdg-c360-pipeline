@@ -1,8 +1,9 @@
 # Mục đích: Kiểm manifest/baseline rồi áp giao dịch nguồn hoàn chỉnh vào Mirror test.
 # Đầu vào: Record đã gom đủ, epoch/baseline và kết nối PostgreSQL test.
 # Đầu ra: Mirror, inbox, ledger và checkpoint commit nguyên khối; lỗi dữ liệu được quarantine.
-"""Atomic test-only transaction applier. No Source configuration or Kafka offset writes."""
+"""Atomic transaction applier; default test target or explicitly guarded cutover scope."""
 import uuid
+import re
 from collections import Counter
 from psycopg import sql
 from psycopg.types.json import Jsonb
@@ -19,8 +20,10 @@ def validate(document):
     # BƯỚC 1: Baseline phải được khai báo cho đủ bốn bảng, cùng range hữu hạn; không suy baseline từ offset.
     if not isinstance(document, dict) or document.get("format") != "hdg-sink-prototype-v1":
         raise Rejected("MANIFEST_FORMAT")
-    if document.get("mode") not in ("synthetic-test", "captured-fixture-test"):
-        raise Rejected("TEST_MANIFEST_REQUIRED", "no live/cutover mode exists")
+    from storage import cutover_profile
+    live = document.get("mode") == "cutover-live" and (cutover_profile() or {}).get("purpose") == "live"
+    if document.get("mode") not in ("synthetic-test", "captured-fixture-test") and not live:
+        raise Rejected("TEST_MANIFEST_REQUIRED", "explicit verified cutover scope required")
     if document.get("identity_policy") != "experimental-redo-v1":
         raise Rejected("IDENTITY_POLICY")
     uuid.UUID(document["epoch"])
@@ -32,20 +35,31 @@ def validate(document):
     if prefix not in ("hdg_sink_test", "hdg_observe"):
         raise Rejected("TOPIC_PREFIX")
     baseline = document.get("baseline")
-    if not isinstance(baseline, dict) or baseline.get("assertion") != "verified-test-baseline":
+    if not isinstance(baseline, dict) or baseline.get("assertion") != ("verified-source-baseline" if live else "verified-test-baseline"):
         raise Rejected("EXPLICIT_BASELINE_REQUIRED")
     integer(baseline.get("scn"), "test baseline SCN", 0)
     tables = baseline.get("tables", {})
     if set(tables) != set(TABLES):
         raise Rejected("BASELINE_ALL_FOUR_TABLES")
+    baseline_kind = baseline.get("kind", "inline")
+    if baseline_kind not in ("inline", "spark-stage-v2"):
+        raise Rejected("BASELINE_KIND")
+    if baseline_kind == "spark-stage-v2":
+        uuid.UUID(baseline["run_id"])
     for source, spec in tables.items():
-        if not isinstance(spec.get("rows"), list):
-            raise Rejected("BASELINE_ROWS")
-        # Validate schema even when the declared baseline is empty.
         from protocol import descriptors
         descriptors(spec.get("schema"), TABLES[source])
-        for raw in spec["rows"]:
-            row(raw, spec["schema"], TABLES[source])
+        if baseline_kind == "spark-stage-v2":
+            if "rows" in spec:
+                raise Rejected("STAGE_BASELINE_MUST_REFERENCE_AUDIT")
+            integer(spec.get("row_count"), "stage row count", 0)
+            if not isinstance(spec.get("stage_digest"), str) or not re.fullmatch(r"[0-9a-f]{64}", spec["stage_digest"]):
+                raise Rejected("STAGE_BASELINE_DIGEST")
+        else:
+            if not isinstance(spec.get("rows"), list):
+                raise Rejected("BASELINE_ROWS")
+            for raw in spec["rows"]:
+                row(raw, spec["schema"], TABLES[source])
     streams = {}
     allowed = {prefix + ".VSS." + source for source in TABLES} | {prefix + ".transaction"}
     for spec in document.get("streams", []):
@@ -129,18 +143,84 @@ def initialize(connection, document):
         for table in TABLES.values():
             if connection.execute(sql.SQL("SELECT count(*) FROM {}").format(relation(table))).fetchone()[0]:
                 raise Rejected("TEST_MIRROR_NOT_EMPTY")
-        connection.execute(
-            "INSERT INTO sink_meta.epochs VALUES(%s,%s,%s,'ACTIVE',0,%s)",
-            (document["epoch"],manifest_hash(document),Jsonb(canonical(document)),document["baseline"]["scn"]))
-        for stream in document["streams"]:
-            connection.execute(
-                "INSERT INTO sink_meta.checkpoints VALUES(%s,%s,%s,%s,%s)",
-                (document["epoch"],stream["topic"],stream["topic_id"],stream["partition"],stream["start"]))
+        _register_epoch(connection, document)
+        if document["baseline"].get("kind") == "spark-stage-v2":
+            _initialize_stage(connection, document)
+            return
         for name, spec in document["baseline"]["tables"].items():
             table = TABLES[name]
             for raw in spec["rows"]:
                 insert_row(connection, table, row(raw,spec["schema"],table))
 
+
+
+def _register_epoch(connection, document):
+    # Chỉ gọi trong transaction đã kiểm schema/đích và khóa advisory.
+    connection.execute(
+        "INSERT INTO sink_meta.epochs VALUES(%s,%s,%s,'ACTIVE',0,%s)",
+        (document["epoch"],manifest_hash(document),Jsonb(canonical(document)),document["baseline"]["scn"]))
+    for stream in document["streams"]:
+        connection.execute(
+            "INSERT INTO sink_meta.checkpoints VALUES(%s,%s,%s,%s,%s)",
+            (document["epoch"],stream["topic"],stream["topic_id"],stream["partition"],stream["start"]))
+
+def _initialize_stage(connection, document, destination=None):
+    """Copy an audited Stage run within the same explicitly guarded database."""
+    # BƯỚC 1: Khóa run và Stage, kiểm SCN/schema/audit; không đọc từ database live.
+    from schema_contract import checked_expression, validate_pg_columns
+    # Baseline lớn cần ngân sách dài hơn DML CDC; LOCAL tự khôi phục sau transaction.
+    connection.execute("SET LOCAL statement_timeout='180s'")
+    if destination is not None and not re.fullmatch(r"hdg_cutover_[0-9a-f]{32}", destination):
+        raise Rejected("INVALID_STAGE_DESTINATION")
+    baseline = document["baseline"]
+    run_id = baseline["run_id"]
+    run = connection.execute(
+        "SELECT source_scn,status FROM hdg_load.runs WHERE run_id=%s FOR UPDATE", (run_id,)).fetchone()
+    if run != (baseline["scn"], "VALIDATED"):
+        raise Rejected("STAGE_BASELINE_RUN")
+    for table in TABLES.values():
+        connection.execute(sql.SQL("LOCK TABLE {} IN SHARE MODE").format(
+            sql.Identifier("hdg_stage", table["mirror"])))
+    for name, table in TABLES.items():
+        expected = baseline["tables"][name]
+        actual_schema = connection.execute(
+            "SELECT a.attname,pg_catalog.format_type(a.atttypid,a.atttypmod),"
+            "CASE WHEN a.attnotnull THEN 'true' ELSE 'false' END "
+            "FROM pg_attribute a WHERE a.attrelid=%s::regclass AND a.attnum>0 AND NOT a.attisdropped ORDER BY a.attnum",
+            ("hdg_stage." + table["mirror"],)).fetchall()
+        validate_pg_columns(actual_schema,
+            [(c["name"], "text", "true" if c["required"] else "false") for c in table["columns"]]
+            + [("load_run_id", "character varying(36)", "true")], "Stage baseline " + name)
+        audit = connection.execute(
+            "SELECT source_rows,stage_rows,content_equal,stage_digest FROM hdg_load.table_runs "
+            "WHERE run_id=%s AND source_table=%s FOR SHARE", (run_id, name)).fetchone()
+        if audit != (expected["row_count"], expected["row_count"], True, expected["stage_digest"]):
+            raise Rejected("STAGE_BASELINE_AUDIT", name)
+        current_digest = connection.execute("SELECT hdg_load.stage_digest(%s,%s)",
+                                            (table["mirror"], run_id)).fetchone()[0]
+        stage = sql.Identifier("hdg_stage", table["mirror"])
+        count = connection.execute(sql.SQL("SELECT count(*) FROM {} WHERE load_run_id=%s").format(stage),
+                                   (run_id,)).fetchone()[0]
+        if current_digest != expected["stage_digest"] or count != expected["row_count"]:
+            raise Rejected("STAGE_BASELINE_CONTENT", name)
+    # Chỉ bắt đầu copy sau khi cả bốn audit/schema/digest đều đã hợp lệ.
+    for name, table in TABLES.items():
+        stage = sql.Identifier("hdg_stage", table["mirror"])
+        target = sql.Identifier(destination, table["mirror"]) if destination else relation(table)
+        # BƯỚC 2: Chuyển kiểu bằng guard v2; sai độ dài/precision phải lỗi, không cắt/làm tròn.
+        columns = sql.SQL(",").join(sql.Identifier(c["name"]) for c in table["columns"])
+        typed = sql.SQL(",").join(sql.SQL(checked_expression(c)) for c in table["columns"])
+        connection.execute(sql.SQL("INSERT INTO {} ({}) SELECT {} FROM {} WHERE load_run_id=%s").format(
+            target, columns, typed, stage), (run_id,))
+        # BƯỚC 3: So hai chiều, giữ cả dòng trùng; lỗi rollback cả baseline và epoch/checkpoint.
+        difference = connection.execute(sql.SQL(
+            "WITH typed AS MATERIALIZED (SELECT {} FROM {} WHERE load_run_id=%s) "
+            "SELECT count(*) FROM ((SELECT {} FROM {} EXCEPT ALL SELECT * FROM typed) "
+            "UNION ALL (SELECT * FROM typed EXCEPT ALL SELECT {} FROM {})) d").format(
+                typed, stage, columns, target, columns, target),
+                (run_id,)).fetchone()[0]
+        if difference:
+            raise Rejected("STAGE_BASELINE_COPY_MISMATCH", name)
 
 def transaction(events, spec, incarnation):
     # BƯỚC 3: Gom đúng giao dịch, kiểm END/count/order; thiếu sự kiện thì chưa được áp vào Mirror.
@@ -232,7 +312,7 @@ def _quarantine(connection,epoch,frame_no,records,error):
         connection.execute("UPDATE sink_meta.epochs SET state='BLOCKED' WHERE epoch=%s",(epoch,))
 
 
-def apply_frame(connection, document, frame_no, records, failpoint=None):
+def apply_frame(connection, document, frame_no, records, failpoint=None, before_commit=None, before_apply=None):
     """Each complete finite source transaction + its metadata commits atomically."""
     # BƯỚC 4: Kiểm manifest/đích, rồi giữ Mirror, inbox, dedup và checkpoint trong cùng một transaction.
     assert_target(connection)
@@ -261,6 +341,8 @@ def apply_frame(connection, document, frame_no, records, failpoint=None):
                 return "REPLAY_FRAME"
             if frame_no!=state[2]:
                 raise Rejected("FRAME_ORDER")
+            if before_apply:
+                before_apply(connection)
             # BƯỚC 5: next_offset phải liên tục và đúng topic ID; mọi cập nhật ở đây còn nằm trong transaction.
             stream_specs={(s["topic"],s["partition"]):s for s in document["streams"]}
             for record in records:
@@ -326,6 +408,8 @@ def apply_frame(connection, document, frame_no, records, failpoint=None):
             connection.execute("INSERT INTO sink_meta.frames VALUES(%s,%s,%s,%s)",
                                (epoch,frame_no,wire_hash,outcome))
             connection.execute("UPDATE sink_meta.epochs SET next_frame=next_frame+1 WHERE epoch=%s",(epoch,))
+            if before_commit:
+                before_commit(connection)
             if failpoint:
                 failpoint("before_commit")
         if failpoint:

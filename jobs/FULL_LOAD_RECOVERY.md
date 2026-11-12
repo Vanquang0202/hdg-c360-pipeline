@@ -65,8 +65,8 @@ Lệnh dưới chỉ là bước triển khai **sau khi integration test và rà
 
 ```powershell
 # Dùng PGPASSWORD trong môi trường, không truyền password trên command line.
-psql -h localhost -p 55432 -U $env:PG_USER -d hdg_mirror -v ON_ERROR_STOP=1 -f sql/postgres/03_fix_mirror_contract.sql
-psql -h localhost -p 55432 -U $env:PG_USER -d hdg_mirror -v ON_ERROR_STOP=1 -f sql/postgres/04_build_recovery_candidate.sql
+psql -h localhost -p 15432 -U $env:PG_USER -d hdg_mirror -v ON_ERROR_STOP=1 -f sql/postgres/03_fix_mirror_contract.sql
+psql -h localhost -p 15432 -U $env:PG_USER -d hdg_mirror -v ON_ERROR_STOP=1 -f sql/postgres/04_build_recovery_candidate.sql
 ```
 
 ## 5. Trình tự phục hồi khi Debezium đã phát sự kiện
@@ -151,7 +151,7 @@ Bộ sửa này cố ý không có hàm restore trực tiếp hoặc reset boots
 & C:\Python311\python.exe -B jobs/build_full_load_sql.py --check
 & C:\Python311\python.exe -B tests/full_load/test_spark_transport.py
 # Chỉ chạy integration sau khi tự tạo database test riêng, rỗng:
-psql -h localhost -p 55432 -U $env:PG_USER -d hdg_full_load_test -v ON_ERROR_STOP=1 -f tests/full_load/integration.sql
+psql -h localhost -p 15432 -U $env:PG_USER -d hdg_full_load_test -v ON_ERROR_STOP=1 -f tests/full_load/integration.sql
 ```
 
 Integration script tự chặn nếu database không đúng hdg_full_load_test hoặc đã có hdg_load. Nó thực hiện DDL/DML trong database test khi người vận hành gọi; không chạy trên hdg_mirror. Script để lại đối tượng/bằng chứng trong database test, không tự DROP database.

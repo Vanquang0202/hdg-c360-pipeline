@@ -42,7 +42,7 @@ Cấu hình kết nối bằng biến môi trường. Địa chỉ PostgreSQL l�
 $env:ORACLE_JDBC_URL = "jdbc:oracle:thin:@//localhost:1521/FREEPDB1"
 $env:ORACLE_USER = "VSS"
 $env:ORACLE_PASSWORD = [System.Net.NetworkCredential]::new("", (Read-Host "Oracle password" -AsSecureString)).Password
-$env:PG_JDBC_URL = "jdbc:postgresql://localhost:55432/hdg_mirror"
+$env:PG_JDBC_URL = "jdbc:postgresql://localhost:15432/hdg_mirror"
 $env:PG_USER = "postgres"
 $env:PG_PASSWORD = [System.Net.NetworkCredential]::new("", (Read-Host "PostgreSQL password" -AsSecureString)).Password
 ```
@@ -92,8 +92,8 @@ Oracle dùng NLS_DATE_LANGUAGE=AMERICAN và NLS_CALENDAR=GREGORIAN cho các phi�
 
 ```powershell
 $env:PGPASSWORD = $env:PG_PASSWORD
-psql -h localhost -p 55432 -U $env:PG_USER -d hdg_mirror -v ON_ERROR_STOP=1 -f sql/postgres/01_create_mirror_tables.sql
-psql -h localhost -p 55432 -U $env:PG_USER -d hdg_mirror -v ON_ERROR_STOP=1 -f sql/postgres/02_publish_full_load.sql
+psql -h localhost -p 15432 -U $env:PG_USER -d hdg_mirror -v ON_ERROR_STOP=1 -f sql/postgres/01_create_mirror_tables.sql
+psql -h localhost -p 15432 -U $env:PG_USER -d hdg_mirror -v ON_ERROR_STOP=1 -f sql/postgres/02_publish_full_load.sql
 Remove-Item Env:PGPASSWORD
 ```
 

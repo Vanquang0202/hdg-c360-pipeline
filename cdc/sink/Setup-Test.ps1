@@ -1,6 +1,6 @@
 # Mục đích: Chuẩn bị riêng PostgreSQL test cho CDC Sink prototype.
 # Đầu vào: Image postgres:16 có sẵn, .env.test local và tùy chọn -RunTests.
-# Đầu ra: Container test cổng 55433; chỉ chạy unit/integration khi có -RunTests.
+# Đầu ra: Container test cổng 15433; chỉ chạy unit/integration khi có -RunTests.
 param([switch]$RunTests)
 $ErrorActionPreference = "Stop"
 $compose = Join-Path $PSScriptRoot "compose.test.yaml"
@@ -37,7 +37,7 @@ for ($attempt = 0; $attempt -lt 30; $attempt++) {
     Start-Sleep -Seconds 1
 }
 if (-not $healthy) { throw "Test PostgreSQL did not become healthy" }
-Write-Host "Only hdg-cdc-sink-test prepared at localhost:55433."
+Write-Host "Only hdg-cdc-sink-test prepared at localhost:15433."
 # BƯỚC 4: Test chỉ định rõ DB test; integration có reset fixture nên không tự chạy ở lượt rút gọn source.
 if ($RunTests) {
     if (-not (Test-Path -LiteralPath $python)) { throw "Install the project-local venv first; see PROTOTYPE.md" }

@@ -1,8 +1,11 @@
 # Mục đích: Tạo/kiểm schema và thực hiện SQL chỉ trong PostgreSQL test riêng.
 # Đầu vào: Kết nối đúng endpoint test, hợp đồng kiểu và giá trị đã giải mã.
 # Đầu ra: Bảng test cùng metadata; mọi kết nối sai đích bị chặn trước khi ghi.
-"""PostgreSQL test-only storage; host/port/database/schema cannot be overridden."""
+"""Default test-only storage; public cutover requires an explicit verified scope."""
 import os
+import re
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 import psycopg
 from psycopg import sql
@@ -11,6 +14,35 @@ from protocol import Rejected
 
 TOKEN = "hdg-cdc-sink-prototype-test-only-v1"
 HERE = Path(__file__).resolve().parent
+
+
+_CUTOVER = ContextVar("hdg_cutover_target", default=None)
+CUTOVER_TOKEN = "hdg-c360-cutover-v1"
+
+
+def cutover_profile():
+    return _CUTOVER.get()
+
+
+@contextmanager
+def cutover_target(connection, database, confirmation, purpose="clone", live_checked=False):
+    # Phạm vi tường minh; mặc định prototype vẫn chỉ vào cổng 15433/mirror_test.
+    clone = bool(re.fullmatch(r"hdg_cutover_clone_[0-9a-f]{8}_test", database))
+    live = database == "hdg_mirror" and purpose == "live" and live_checked
+    if confirmation != database or not ((clone and purpose == "clone") or live):
+        raise ValueError("Explicit validated cutover endpoint required")
+    if (connection.info.host != "127.0.0.1" or connection.info.port != 15432
+            or connection.info.dbname != database):
+        raise ValueError("Refusing cutover endpoint")
+    token = _CUTOVER.set(dict(database=database, user=connection.info.user, purpose=purpose))
+    try:
+        yield
+    finally:
+        _CUTOVER.reset(token)
+
+
+def mirror_namespace():
+    return "public" if cutover_profile() else MIRROR_SCHEMA
 
 
 # Mật khẩu chỉ lấy từ môi trường hoặc .env.test local; không đọc cấu hình Mirror live.
@@ -27,7 +59,7 @@ def password():
 
 
 def connect_test():
-    # BƯỚC 1: Kết nối cố định test DB/cổng 55433; không có tùy chọn rơi về PostgreSQL live.
+    # BƯỚC 1: Kết nối cố định test DB/cổng 15433; không có tùy chọn rơi về PostgreSQL live.
     connection = psycopg.connect(host="127.0.0.1", port=PORT, dbname=DATABASE,
                                  user="sink_test_owner", password=password(), autocommit=True,
                                  connect_timeout=5, options="-c search_path=pg_catalog -c timezone=UTC")
@@ -40,7 +72,7 @@ def connect_test():
     return connection
 
 
-def ddl():
+def ddl(metadata_only=False):
     # Dựng bảng test từ contract v2; giữ PK đúng hai danh mục và byte-check cho chuỗi.
     parts = [
         "CREATE SCHEMA mirror_test", "CREATE SCHEMA sink_meta",
@@ -73,6 +105,8 @@ def ddl():
             reason text NOT NULL, raw_records jsonb NOT NULL,
             created_at timestamptz NOT NULL DEFAULT clock_timestamp())""",
     ]
+    if metadata_only:
+        return ";\n".join(parts[1:]) + ";\n"
     for table in TABLES.values():
         columns = [f"{c['name']} {c['postgres']}" + (" NOT NULL" if c["required"] else "")
                    for c in table["columns"]]
@@ -85,8 +119,12 @@ def ddl():
 
 
 def assert_endpoint(connection):
-    # Chặn sai host/cổng/database/user trước SQL tạo hoặc sửa fixture.
-    if (connection.info.dbname!=DATABASE or connection.info.host!="127.0.0.1"
+    profile = cutover_profile()
+    if profile:
+        if (connection.info.dbname != profile["database"] or connection.info.host != "127.0.0.1"
+                or connection.info.port != 15432 or connection.info.user != profile["user"]):
+            raise ValueError("Refusing cutover endpoint")
+    elif (connection.info.dbname!=DATABASE or connection.info.host!="127.0.0.1"
             or connection.info.port!=PORT or connection.info.user!="sink_test_owner"):
         raise ValueError("Refusing non-test endpoint")
 
@@ -94,6 +132,8 @@ def assert_endpoint(connection):
 def bootstrap(connection):
     # BƯỚC 2: Chỉ tạo schema khi chưa có và không chiếm cấu trúc lạ; marker/hash giữ đúng môi trường test.
     assert_endpoint(connection)
+    if cutover_profile():
+        raise ValueError("Use cutover preparation, never test bootstrap")
     if connection.execute("SELECT to_regclass('sink_meta.guard')").fetchone()[0] is not None:
         assert_target(connection)
         return False
@@ -109,22 +149,26 @@ def bootstrap(connection):
 def assert_target(connection):
     # BƯỚC 3: Kiểm marker, đủ kiểu/NULL/PK/byte-check và các dependency không được phép.
     assert_endpoint(connection)
-    if not connection.autocommit or connection.info.dbname != DATABASE:
+    if cutover_profile():
+        identity=connection.execute("SELECT current_database(),current_user,current_setting('server_encoding')").fetchone()
+        if identity != (cutover_profile()["database"],cutover_profile()["user"],"UTF8"):
+            raise ValueError("Cutover identity/encoding differs")
+    if not connection.autocommit or connection.info.dbname != (cutover_profile() or {}).get("database", DATABASE):
         raise ValueError("Test connection must use autocommit and the dedicated test database")
     marker = connection.execute("SELECT token,contract_hash FROM sink_meta.guard WHERE singleton").fetchone()
-    if marker != (TOKEN, CONTRACT_HASH):
+    if marker != (CUTOVER_TOKEN if cutover_profile() else TOKEN, CONTRACT_HASH):
         raise ValueError("Test-only marker or schema contract differs")
     for table in TABLES.values():
         actual = connection.execute(
             "SELECT a.attname,format_type(a.atttypid,a.atttypmod),a.attnotnull "
             "FROM pg_attribute a WHERE a.attrelid=%s::regclass AND a.attnum>0 AND NOT a.attisdropped "
-            "ORDER BY a.attnum", ("mirror_test." + table["mirror"],)).fetchall()
+            "ORDER BY a.attnum", (mirror_namespace() + "." + table["mirror"],)).fetchall()
         expected = [(c["name"], pg_catalog_type(c), c["required"]) for c in table["columns"]]
         if actual != expected:
             raise Rejected("TARGET_SCHEMA", table["mirror"])
         constraints = connection.execute(
             "SELECT contype::text,pg_get_constraintdef(oid),convalidated FROM pg_constraint "
-            "WHERE conrelid=%s::regclass", ("mirror_test." + table["mirror"],)).fetchall()
+            "WHERE conrelid=%s::regclass", (mirror_namespace() + "." + table["mirror"],)).fetchall()
         pk = [definition for kind,definition,valid in constraints if kind == "p" and valid]
         if pk != (["PRIMARY KEY (id)"] if table["primary_key"] else []):
             raise Rejected("TARGET_PRIMARY_KEY", table["mirror"])
@@ -134,20 +178,25 @@ def assert_target(connection):
                     "SELECT count(*) FROM pg_constraint WHERE conrelid=%s::regclass AND contype='c' "
                     "AND convalidated AND replace(regexp_replace(pg_get_expr(conbin,conrelid),"
                     "'[[:space:]()]','','g'),'::text','')=%s",
-                    ("mirror_test."+table["mirror"], f"octet_length{c['name']}<={c['length']}")).fetchone()[0]
+                    (mirror_namespace()+"."+table["mirror"], f"octet_length{c['name']}<={c['length']}")).fetchone()[0]
                 if valid != 1:
                     raise Rejected("TARGET_BYTE_CONSTRAINT", c["name"])
         unsafe = connection.execute(
             "SELECT (SELECT count(*) FROM pg_trigger WHERE tgrelid=%s::regclass AND NOT tgisinternal)"
             "+(SELECT count(*) FROM pg_policy WHERE polrelid=%s::regclass)"
             "+(SELECT count(*) FROM pg_constraint WHERE conrelid=%s::regclass AND contype='f')",
-            ("mirror_test."+table["mirror"],)*3).fetchone()[0]
+            (mirror_namespace()+"."+table["mirror"],)*3).fetchone()[0]
+        if cutover_profile():
+            unsafe += connection.execute(
+                "SELECT (SELECT count(*) FROM pg_constraint WHERE contype='f' AND confrelid=%s::regclass)"
+                "+(SELECT count(*) FROM pg_class WHERE oid=%s::regclass AND (relrowsecurity OR relforcerowsecurity))",
+                (mirror_namespace()+"."+table["mirror"],)*2).fetchone()[0]
         if unsafe:
             raise Rejected("TEST_TARGET_HAS_EXTERNAL_POLICIES_OR_TRIGGERS")
 
 
 def relation(table):
-    return sql.Identifier(MIRROR_SCHEMA, table["mirror"])
+    return sql.Identifier(mirror_namespace(), table["mirror"])
 
 
 def insert_row(connection, table, values):
@@ -174,6 +223,8 @@ def matching_where(table, image, names=None):
 def reset_test_fixture(connection):
     """Explicitly destroy ONLY prototype fixtures after verifying the fixed test endpoint."""
     # Chỉ reset bảng test được liệt kê sau khi xác nhận endpoint/marker; không dùng để sửa lỗi live.
+    if cutover_profile():
+        raise ValueError("Test reset forbidden for cutover targets")
     assert_target(connection)
     names=[("sink_meta",name) for name in (
         "quarantine","frames","transaction_ledger","event_ledger","inbox","checkpoints","epochs")]

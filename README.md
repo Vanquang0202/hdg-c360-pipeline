@@ -68,11 +68,11 @@ Các lệnh dưới chạy bằng **PowerShell 7**, tại thư mục gốc proje
 | Thành phần | Cấu hình trong project |
 |---|---|
 | Oracle nguồn | Oracle Free, container `hdg-c360-oracle`, service `FREEPDB1`, schema `VSS`, cổng 1521 |
-| PostgreSQL Mirror | PostgreSQL 16, container `hdg-c360-postgres`, database `hdg_mirror`, cổng 55432 |
+| PostgreSQL Mirror | PostgreSQL 16, container `hdg-c360-postgres`, database `hdg_mirror`, cổng 15432 |
 | Spark | PySpark 4.0.1, `local[2]`; launcher mặc định dùng `C:\Python311\python.exe` |
 | Kafka | `apache/kafka:3.8.1`; Windows dùng `localhost:29092`, container dùng `kafka:9092` |
 | Kafka Connect | `quay.io/debezium/connect:3.4.3.Final`, REST tại `http://localhost:8083` |
-| PostgreSQL Sink test | Database `hdg_cdc_sink_test`, user `sink_test_owner`, cổng 55433 |
+| PostgreSQL Sink test | Database `hdg_cdc_sink_test`, user `sink_test_owner`, cổng 15433 |
 
 Cài dependency cho generator và Spark, tạo môi trường Python riêng cho Sink:
 
