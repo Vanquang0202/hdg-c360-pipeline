@@ -146,15 +146,15 @@ def bootstrap(connection):
     return True
 
 
-def allowed_c360_trigger(connection,relation_name):
+def allowed_c360_trigger(connection,relation_name,observer=False):
     from c360_full_load import checked_queue_trigger, Blocked
     try:
-        return checked_queue_trigger(connection,relation_name)
+        return checked_queue_trigger(connection,relation_name,observer=observer)
     except Blocked as error:
         raise Rejected("UNAPPROVED_C360_TRIGGER",str(error)) from error
 
 
-def assert_target(connection):
+def assert_target(connection,observer=False):
     # BƯỚC 3: Kiểm marker, đủ kiểu/NULL/PK/byte-check và các dependency không được phép.
     assert_endpoint(connection)
     if cutover_profile():
@@ -199,7 +199,7 @@ def assert_target(connection):
                 "SELECT (SELECT count(*) FROM pg_constraint WHERE contype='f' AND confrelid=%s::regclass)"
                 "+(SELECT count(*) FROM pg_class WHERE oid=%s::regclass AND (relrowsecurity OR relforcerowsecurity))",
                 (mirror_namespace()+"."+table["mirror"],)*2).fetchone()[0]
-        unsafe -= allowed_c360_trigger(connection,mirror_namespace()+"."+table["mirror"])
+        unsafe -= allowed_c360_trigger(connection,mirror_namespace()+"."+table["mirror"],observer=observer)
         if unsafe:
             raise Rejected("TEST_TARGET_HAS_EXTERNAL_POLICIES_OR_TRIGGERS")
 

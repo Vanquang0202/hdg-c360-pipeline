@@ -20,7 +20,7 @@ import storage
 import engine
 from contract import TABLES, CONTRACT_HASH
 from protocol import canonical, digest, Rejected, decode
-from kafka_reader import read_ranges
+from kafka_reader import read_ranges, native_metadata, assert_topic
 
 
 def require(condition, reason):
@@ -108,17 +108,22 @@ exit
     from confluent_kafka import Consumer, TopicPartition, TopicCollection
     admin = AdminClient({"bootstrap.servers":"localhost:29092","broker.address.family":"v4"})
     streams = b["streams"] if rollback_proof is not None else plan["manifest"]["streams"]
-    require({(s["topic"],s["partition"],s["topic_id"]) for s in streams} ==
-            {(s["topic"],s["partition"],s["topic_id"]) for s in plan["manifest"]["streams"]}, "LIVE_VECTOR_INCOMPLETE")
+    require({(s["topic"],s["partition"]) for s in streams} ==
+            {(s["topic"],s["partition"]) for s in plan["manifest"]["streams"]}, "LIVE_VECTOR_INCOMPLETE")
     require(scn>=plan["manifest"]["baseline"]["scn"], "LIVE_FENCE_SCN_REGRESSION")
-    topics = admin.describe_topics(TopicCollection([s["topic"] for s in streams]))
+    cluster,native_ids,_ = native_metadata(admin,[s["topic"] for s in streams])
+    from kafka_reader import load_bindings
+    bindings=load_bindings(connection,plan["manifest"]["epoch"])
     consumer = Consumer({"bootstrap.servers":"localhost:29092","broker.address.family":"v4","group.id":"hdg-live-gate-"+uuid.uuid4().hex,
                          "enable.auto.commit":False,"enable.auto.offset.store":False,"allow.auto.create.topics":False})
     try:
         for s in streams:
             require(s["start"] == s["end"], "LIVE_VECTOR_NOT_EMPTY")
             lo,hi = consumer.get_watermark_offsets(TopicPartition(s["topic"],s["partition"]),timeout=10)
-            require(hi == s["start"] and lo <= hi and str(topics[s["topic"]].result(timeout=10).topic_id) == s["topic_id"],
+            assert_topic(s["topic"],s["topic_id"],native_ids[s["topic"]],cluster,bindings)
+            expected=next(x for x in plan["manifest"]["streams"] if x["topic"]==s["topic"] and x["partition"]==s["partition"])
+            assert_topic(s["topic"],expected["topic_id"],native_ids[s["topic"]],cluster,bindings)
+            require(hi == s["start"] and lo <= hi,
                     "LIVE_FRONTIER_CHANGED")
     finally:
         consumer.close()
@@ -156,8 +161,10 @@ def target(connection, plan, confirmation, command, rollback_proof=None):
         require(connection.execute("SELECT pg_try_advisory_lock(631874,2)").fetchone()[0], "SINK_WRITER_ALREADY_RUNNING")
     try:
         with storage.cutover_target(connection,plan["target"]["database"],confirmation,purpose,checked):
-            engine.validate(plan["manifest"])
-            yield
+            from kafka_reader import identity_scope
+            with identity_scope(connection,plan["manifest"]["epoch"],maintenance=command=="identity-maintenance"):
+                engine.validate(plan["manifest"])
+                yield
     finally:
         if writer and not connection.closed:
             connection.execute("SELECT pg_advisory_unlock(631874,2)")
@@ -237,7 +244,7 @@ def ownership_matches(connection, expected):
     return True
 
 
-def safe_schema(connection):
+def safe_schema(connection,observer=False):
     connection.execute("SELECT hdg_load.assert_mirror_schema()")
     for t in TABLES.values():
         unsafe = connection.execute(
@@ -245,7 +252,7 @@ def safe_schema(connection):
             "+(SELECT count(*) FROM pg_constraint WHERE contype='f' AND (conrelid=%s::regclass OR confrelid=%s::regclass))"
             "+(SELECT count(*) FROM pg_class WHERE oid=%s::regclass AND (relrowsecurity OR relforcerowsecurity))",
             ("public."+t["mirror"],)*4).fetchone()[0]
-        unsafe -= storage.allowed_c360_trigger(connection,"public."+t["mirror"])
+        unsafe -= storage.allowed_c360_trigger(connection,"public."+t["mirror"],observer=observer)
         require(unsafe == 0,"CUTOVER_HAS_UNSUPPORTED_TRIGGER_FK_RLS")
 
 
@@ -327,9 +334,9 @@ def record(connection, plan):
 
 
 
-def assert_handoff(connection, plan, allow_blocked=False):
+def assert_handoff(connection, plan, allow_blocked=False, read_only=False):
     document = plan["manifest"]
-    control=connection.execute("SELECT cdc_enabled,last_run_id FROM hdg_load.control WHERE id=1 FOR SHARE").fetchone()
+    control=connection.execute("SELECT cdc_enabled,last_run_id FROM hdg_load.control WHERE id=1" + ("" if read_only else " FOR SHARE")).fetchone()
     require(control and control[1]==plan["run_id"] and (control[0] or allow_blocked), "HANDOFF_CONTROL")
     row = connection.execute("SELECT state,next_frame,manifest_hash FROM sink_meta.epochs WHERE epoch=%s",
                              (document["epoch"],)).fetchone()
@@ -492,7 +499,7 @@ def make_live_plan(connection, run_id, barrier, rehearsal_proof, backup):
             description=descriptions[topic].result(timeout=10)
             require([p.id for p in description.partitions]==[0],"LIVE_PLAN_PARTITIONS")
             low,high=consumer.get_watermark_offsets(TopicPartition(topic,0),timeout=10)
-            streams.append(dict(topic=topic,topic_id=str(description.topic_id),partition=0,start=high,end=high))
+            streams.append(dict(topic=topic,topic_id=native_metadata(admin,[topic])[1][topic],partition=0,start=high,end=high))
     finally:consumer.close()
     document=dict(format="hdg-sink-prototype-v1",mode="cutover-live",identity_policy="experimental-redo-v1",
         epoch=str(uuid.uuid4()),contract_hash=CONTRACT_HASH,source_incarnation=barrier["source_incarnation"],
@@ -510,9 +517,114 @@ def make_live_plan(connection, run_id, barrier, rehearsal_proof, backup):
         engine.validate(document)
     return plan
 
+def prove_topic_identities(connection,plan,genesis):
+    """Nguồn gốc UUID + toàn bộ wire prefix đã ACK; không sửa metadata cũ."""
+    import base64
+    from dataclasses import replace
+    from confluent_kafka.admin import AdminClient
+    from kafka_reader import canonical_uuid
+    document=plan['manifest'];epoch=document['epoch']
+    storage.assert_target(connection);safe_schema(connection)
+    sealed=connection.execute('SELECT plan,last_data,before_ownership FROM hdg_load.cutovers WHERE id=%s',(plan['id'],)).fetchone()
+    require(sealed and sealed[0]==plan and table_hashes(connection)==sealed[1] and ownership_matches(connection,sealed[2]),'IDENTITY_SEALED_STATE_CHANGED')
+    assert_handoff(connection,plan)
+    state=connection.execute('SELECT next_frame FROM sink_meta.epochs WHERE epoch=%s',(epoch,)).fetchone()[0]
+    require(state==len(document['frames']),'IDENTITY_PENDING_FRAMES')
+    cp=checkpoints(connection,epoch)
+    require({(t,p):n for t,tid,p,n in cp}=={(s['topic'],s['partition']):s['end'] for s in document['streams']},'IDENTITY_NOT_AT_FRONTIER')
+    admin=AdminClient({'bootstrap.servers':'127.0.0.1:29092','broker.address.family':'v4'})
+    cluster,ids,descriptions=native_metadata(admin,[r[0] for r in cp])
+    created=connection.execute('SELECT created_at FROM hdg_load.cutovers WHERE id=%s',(plan['id'],)).fetchone()[0]
+    names=set(ids);origin={t:[] for t in names};removed=set();next_offset=0;batches=0
+    with Path(genesis).open(encoding='utf-8') as file:
+        for line in file:
+            if line.startswith('baseOffset:'):
+                m=re.search(r'baseOffset: (\d+) lastOffset: (\d+)',line)
+                require(m and int(m[1])==next_offset and 'isvalid: true' in line,'KRAFT_GENESIS_GAP_OR_CRC')
+                next_offset=int(m[2])+1;batches+=1
+            if ' payload: ' not in line:continue
+            payload=json.loads(line.split(' payload: ',1)[1])
+            if payload['type']=='TOPIC_RECORD' and payload['data']['name'] in names:
+                m=re.search(r'offset: (\d+) CreateTime: (\d+)',line);require(m is not None,'KRAFT_RECORD_TIME')
+                origin[payload['data']['name']].append(dict(offset=int(m[1]),created_ms=int(m[2]),native_id=canonical_uuid(payload['data']['topicId'])))
+            if payload['type']=='REMOVE_TOPIC_RECORD':removed.add(canonical_uuid(payload['data']['topicId']))
+    require(batches>0,'KRAFT_GENESIS_REQUIRED')
+    topics={}
+    for t,tid,part,n in cp:
+        require(part==0 and {p.id for p in descriptions[t].partitions}=={0},'IDENTITY_PARTITIONS')
+        require(len(origin[t])==1,'TOPIC_RECREATED_OR_ORIGIN_MISSING')
+        record=origin[t][0]
+        require(record['native_id']==ids[t] and ids[t] not in removed,'TOPIC_ID_CHANGED')
+        require(record['created_ms']<int(created.timestamp()*1000),'TOPIC_CREATED_AFTER_CUTOVER')
+        # Đây chỉ là chẩn đoán migration, không dùng phép mất bit trong runtime guard.
+        raw=base64.urlsafe_b64decode(ids[t]+'==')
+        legacy=b''.join(int.from_bytes(raw[j+4:j+8],'big',signed=True).to_bytes(8,'big',signed=True) for j in (0,8))
+        require(base64.b64encode(legacy).decode().rstrip('=')==tid,'LEGACY_ID_NOT_EXACT_SIGNED32_BUG')
+        topics[t]=dict(legacy_id=tid,native_id=ids[t],origin=record)
+    require(len(topics)==5 and len({r['legacy_id'] for r in topics.values()})==5 and len(set(ids.values()))==5,'IDENTITY_NOT_BIJECTIVE')
+    ranges=[dict(spec,topic_id=ids[spec['topic']]) for spec in document['streams']]
+    found_native=read_ranges({'streams':ranges},'127.0.0.1:29092')
+    records=[replace(r,topic_id=topics[r.topic]['legacy_id']) for r in found_native]
+    found=engine.check_records(document,records)
+    inbox=connection.execute('SELECT topic_id,partition,record_offset,wire_hash,raw_record FROM sink_meta.inbox WHERE epoch=%s',(epoch,)).fetchall()
+    stored={(tid,p,n):(h,raw) for tid,p,n,h,raw in inbox}
+    require(len(stored)==len(records),'IDENTITY_INBOX_COVERAGE')
+    for r in records:
+        saved=stored.get((r.topic_id,r.partition,r.offset))
+        require(saved and saved[0]==digest(r.wire()) and canonical(saved[1])==canonical(r.wire()),'IDENTITY_WIRE_CONTENT_CHANGED')
+    for index,frame in enumerate(document['frames']):
+        batch=[found[tuple(key)] for key in frame['records']]
+        old=connection.execute('SELECT fingerprint FROM sink_meta.frames WHERE epoch=%s AND frame_no=%s',(epoch,index)).fetchone()
+        require(old and old[0]==digest([r.wire() for r in batch]),'IDENTITY_FRAME_CHANGED')
+        engine.transaction([decode(r,document['topic_prefix'],document['source_incarnation']) for r in batch],frame,document['source_incarnation'])
+    require(cp==checkpoints(connection,epoch),'IDENTITY_CHECKPOINT_MOVED')
+    return dict(format='hdg-topic-binding-v1',epoch=epoch,cutover_id=plan['id'],cluster_id=cluster,
+        topics=topics,checkpoint=canonical(cp),genesis=str(Path(genesis).resolve()),genesis_sha256=hashlib.sha256(Path(genesis).read_bytes()).hexdigest(),
+        kraft_through_offset=next_offset-1,wire_records=len(records),wire_hash=digest([r.wire() for r in sorted(records,key=lambda r:r.coordinate)]))
+
+
+def bind_topic_identities(connection,plan,proof,rollback=False):
+    # Chỉ thêm binding bổ sung; checkpoint/seal/manifest/raw inbox/frame hash giữ nguyên.
+    from psycopg.types.json import Jsonb
+    fresh=None if rollback else prove_topic_identities(connection,plan,proof['genesis'])
+    hashed=digest(proof)
+    with connection.transaction():
+        connection.execute("SET LOCAL lock_timeout='10s'")
+        require(str(proof['epoch'])==str(plan['manifest']['epoch']) and proof['cutover_id']==plan['id'],'IDENTITY_PROOF_TARGET')
+        connection.execute("""CREATE TABLE IF NOT EXISTS sink_meta.topic_identity_bindings(
+          epoch uuid NOT NULL REFERENCES sink_meta.epochs,topic text NOT NULL,partition integer NOT NULL CHECK(partition=0),
+          legacy_id text NOT NULL,native_id varchar(22) NOT NULL,cluster_id text NOT NULL,
+          proof_hash char(64) NOT NULL,proof jsonb NOT NULL,active boolean NOT NULL DEFAULT true,
+          created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+          PRIMARY KEY(epoch,topic,partition),UNIQUE(epoch,legacy_id),UNIQUE(epoch,native_id))""")
+        previous=connection.execute('SELECT topic,legacy_id,native_id,proof_hash FROM sink_meta.topic_identity_bindings WHERE epoch=%s FOR UPDATE',(proof['epoch'],)).fetchall()
+        if rollback:
+            require(len(previous)==5 and all(row[3]==hashed and proof['topics'].get(row[0],{}).get('legacy_id')==row[1] and proof['topics'].get(row[0],{}).get('native_id')==row[2] for row in previous),'IDENTITY_ROLLBACK_PROOF')
+            connection.execute('UPDATE sink_meta.topic_identity_bindings SET active=false WHERE epoch=%s',(proof['epoch'],))
+            return 'BINDING_REVOKED_WRITERS_FAIL_CLOSED'
+        if not rollback:
+            if not previous:require(fresh==proof,'IDENTITY_PROOF_STALE_OR_CHANGED')
+            else:
+                require(all(fresh[k]==proof[k] for k in ('format','epoch','cutover_id','cluster_id','topics','genesis','genesis_sha256')),'IDENTITY_ORIGIN_CHANGED')
+                from protocol import Record
+                limits={(t,p):n for t,tid,p,n in proof['checkpoint']}
+                records=[Record.from_wire(row[0]) for row in connection.execute('SELECT raw_record FROM sink_meta.inbox WHERE epoch=%s',(proof['epoch'],))]
+                prefix=[r for r in records if r.offset<limits.get((r.topic,r.partition),-1)]
+                require(len(prefix)==proof['wire_records'] and digest([r.wire() for r in sorted(prefix,key=lambda r:r.coordinate)])==proof['wire_hash'],'IDENTITY_ORIGINAL_PREFIX_CHANGED')
+        if previous:
+            require(len(previous)==5 and all(row[3]==hashed and proof['topics'].get(row[0],{}).get('legacy_id')==row[1] and proof['topics'].get(row[0],{}).get('native_id')==row[2] for row in previous),'IDENTITY_BINDING_ALREADY_DIFFERENT')
+            connection.execute('UPDATE sink_meta.topic_identity_bindings SET active=true WHERE epoch=%s',(proof['epoch'],))
+        else:
+            for t,spec in proof['topics'].items():
+                connection.execute('INSERT INTO sink_meta.topic_identity_bindings(epoch,topic,partition,legacy_id,native_id,cluster_id,proof_hash,proof) VALUES(%s,%s,0,%s,%s,%s,%s,%s)',
+                    (proof['epoch'],t,spec['legacy_id'],spec['native_id'],proof['cluster_id'],hashed,Jsonb(proof)))
+        connection.execute('GRANT SELECT ON sink_meta.topic_identity_bindings TO hdg_airflow_reader')
+    return 'BOUND_NATIVE_128_WITHOUT_REWRITING_HISTORY'
+
+
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command",choices=["make-plan","prepare","apply","replay","extend","rollback","status","watch"])
+    parser.add_argument("command",choices=["make-plan","prepare","apply","replay","extend","rollback","status","watch","prove-identities","bind-identities","rollback-identities"])
     parser.add_argument("--plan",type=Path,required=True)
     parser.add_argument("--extension",type=Path)
     parser.add_argument("--confirm-database",required=True)
@@ -526,6 +638,8 @@ def main():
     parser.add_argument("--crash",action="store_true")
     parser.add_argument("--interval",type=float,default=5)
     parser.add_argument("--stop-file",type=Path)
+    parser.add_argument("--identity-proof",type=Path)
+    parser.add_argument("--genesis",type=Path)
     args=parser.parse_args()
     if args.command=="make-plan":
         require(args.confirm_database=="hdg_mirror" and args.run_id and args.barrier
@@ -540,7 +654,7 @@ def main():
             handle.write(json.dumps(plan,indent=2))
         print("Live plan verified and written; no publish executed")
         return
-    if args.command=="watch":
+    if args.command in ("watch","prove-identities","bind-identities","rollback-identities"):
         # Dùng .env hiện có, không in credential. Plan thực tế được đọc lại từ DB mỗi vòng.
         import sys
         sys.path.insert(0,str(Path(__file__).resolve().parents[2]/"jobs"))
@@ -556,7 +670,23 @@ def main():
             connection.close()
             connection=psycopg.connect(**config,autocommit=True)
         with connection:
-            watch(connection,plan,args.confirm_database,interval=args.interval,stop_file=args.stop_file)
+            if args.command=="watch":
+                watch(connection,plan,args.confirm_database,interval=args.interval,stop_file=args.stop_file)
+            else:
+                require(args.identity_proof is not None,"IDENTITY_PROOF_PATH_REQUIRED")
+                active=connection.execute("SELECT plan FROM hdg_load.cutovers WHERE id=%s AND state='ACTIVE'",(plan["id"],)).fetchone()
+                require(active and active[0]["target"]==plan["target"] and active[0]["manifest"]["epoch"]==plan["manifest"]["epoch"],"IDENTITY_ACTIVE_TARGET")
+                plan=active[0]
+                # Rollback phải vào được context khi binding đã revoked, không fallback để replay.
+                with target(connection,plan,args.confirm_database,"identity-maintenance"):
+                    if args.command=="prove-identities":
+                        require(args.genesis is not None and not args.identity_proof.exists(),"IDENTITY_PROOF_OUTPUT")
+                        proof=prove_topic_identities(connection,plan,args.genesis)
+                        args.identity_proof.write_text(json.dumps(proof,indent=2),encoding="utf-8")
+                        print("Identity origin and wire prefix verified; no binding written")
+                    else:
+                        proof=json.loads(args.identity_proof.read_text(encoding="utf-8"))
+                        print(bind_topic_identities(connection,plan,proof,args.command=="rollback-identities"))
         return
     plan=json.loads(args.plan.read_text(encoding="utf-8"))
     purpose=validate_plan(plan)

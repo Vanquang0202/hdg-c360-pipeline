@@ -25,7 +25,7 @@ import storage
 from engine import initialize, validate, check_records, apply_frame, transaction
 from protocol import loads, decode, digest, Rejected
 from fixtures import row_schema
-from kafka_reader import read_ranges
+from kafka_reader import read_ranges,native_metadata
 from confluent_kafka import Consumer, TopicPartition, TopicCollection, KafkaException
 from confluent_kafka.admin import AdminClient
 from psycopg import sql
@@ -40,7 +40,7 @@ def metadata(admin, consumer):
     found = admin.list_topics(timeout=10)
     names = [PREFIX + ".VSS." + name for name in contract.TABLES] + [PREFIX + ".transaction"]
     existing = [name for name in names if name in found.topics]
-    futures = admin.describe_topics(TopicCollection(existing))
+    native = native_metadata(admin,existing)[1] if existing else {}
     result = {}
     for name in names:
         if name not in found.topics:
@@ -57,7 +57,7 @@ def metadata(admin, consumer):
                 if retry == 4:
                     raise
                 time.sleep(1)
-        result[name] = dict(topic=name, topic_id=str(futures[name].result(timeout=10).topic_id),
+        result[name] = dict(topic=name, topic_id=native[name],
                             partition=0, start=low, end=high, exists=True)
     return result
 

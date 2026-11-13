@@ -267,7 +267,7 @@ class ProtocolTests(unittest.TestCase):
                 offset=lambda r=r:r.offset,key=lambda r=r:r.key,value=lambda r=r:r.value,
                 headers=lambda:[],error=lambda:None))
         consumer.poll.side_effect=messages
-        with patch.object(kafka_reader,"AdminClient",return_value=admin),patch.object(
+        with patch.object(kafka_reader,"AdminClient",return_value=admin),patch.object(kafka_reader,"native_metadata",return_value=("test-cluster",b.ids,{t:SimpleNamespace(partitions=[SimpleNamespace(id=0)]) for t in b.ids})),patch.object(
                 kafka_reader,"Consumer",return_value=consumer) as constructor:
             actual=kafka_reader.read_ranges(doc,"test-broker")
         self.assertEqual(len(actual),len(b.records))
@@ -363,7 +363,7 @@ class ContinuousAssemblyTests(unittest.TestCase):
         future=Mock();future.result.return_value=SimpleNamespace(topic_id='id',partitions=[SimpleNamespace(id=0),SimpleNamespace(id=1)])
         admin=Mock();admin.describe_topics.return_value={'topic':future}
         consumer=Mock()
-        with patch.object(continuous,'inspect'),patch.object(continuous.cutover,'assert_handoff',return_value=('ACTIVE',0)),patch.object(continuous.cutover,'checkpoints',return_value=[('topic','id',0,5)]),patch.object(continuous.cutover,'replay') as replay:
+        with patch.object(continuous,'native_metadata',return_value=('cluster',{'topic':'id'},{'topic':future.result.return_value})),patch.object(continuous,'inspect'),patch.object(continuous.cutover,'assert_handoff',return_value=('ACTIVE',0)),patch.object(continuous.cutover,'checkpoints',return_value=[('topic','id',0,5)]),patch.object(continuous.cutover,'replay') as replay:
             with self.assertRaises(Rejected) as ex:continuous.cycle(Mock(),plan,admin,consumer,'unused')
             self.assertEqual(ex.exception.code,'WATCH_PARTITION_LAYOUT_CHANGED')
             consumer.commit.assert_not_called();replay.assert_not_called()
@@ -380,6 +380,30 @@ class ContinuousAssemblyTests(unittest.TestCase):
         with self.assertRaises(Rejected):assemble(dict(b.document(),topic_prefix='wrong'),b.records)
         records=list(b.records);records[1]=replace(records[1],value=b'{invalid')
         with self.assertRaises(Rejected):assemble(b.document(),records)
+
+class ReadOnlyHandoffTests(unittest.TestCase):
+    def test_only_observer_omits_share_lock(self):
+        import cutover,engine
+        document=dict(epoch='test',frames=[],streams=[]);plan=dict(manifest=document,run_id='r')
+        for read_only in (False,True):
+            c=Mock();c.execute.side_effect=[Mock(fetchone=lambda:(True,'r')),Mock(fetchone=lambda:('ACTIVE',0,engine.manifest_hash(document)))]
+            with patch.object(cutover,'checkpoints',return_value=[]):cutover.assert_handoff(c,plan,read_only=read_only)
+            query=c.execute.call_args_list[0].args[0]
+            self.assertEqual('FOR SHARE' in query,not read_only)
+
+class NativeTopicIdentityTests(unittest.TestCase):
+    def test_lossless_base64_and_cross_platform_encoding(self):
+        from kafka_reader import canonical_uuid
+        self.assertEqual(canonical_uuid('ETTRSiX+Rty5xgCu2aAjjg'),canonical_uuid('ETTRSiX-Rty5xgCu2aAjjg'))
+        with self.assertRaises(Rejected):canonical_uuid('not-a-uuid')
+    def test_legacy_requires_verified_binding_not_truncation(self):
+        from kafka_reader import assert_topic
+        legacy='AAAAABQQSP7/////nSDEag';native='uEcVHRQQSP6vcF2gnSDEag'
+        with self.assertRaises(Rejected):assert_topic('t',legacy,native,'cluster')
+        binding={'cluster_id':'cluster','topics':{'t':dict(legacy_id=legacy,native_id=native)}}
+        assert_topic('t',legacy,native,'cluster',binding)
+        with self.assertRaises(Rejected):assert_topic('t',legacy,'uUcVHRQQSP6vcF2gnSDEag','cluster',binding)
+        with self.assertRaises(Rejected):assert_topic('t',legacy,native,'another-cluster',binding)
 
 if __name__=="__main__":
     unittest.main()

@@ -388,7 +388,7 @@ def full_load(conn, bounds=None):
         raise
 
 
-def checked_queue_trigger(conn, relation):
+def checked_queue_trigger(conn, relation, observer=False):
     """Ngoại lệ duy nhất cho guard Sink/cutover; không tin trigger chỉ dựa vào tên."""
     triggers = conn.execute("""
       SELECT t.tgname,t.tgtype,t.tgenabled::text,t.tgqual IS NULL,t.tgnargs,t.tgattr::text,
@@ -424,11 +424,11 @@ def checked_queue_trigger(conn, relation):
       (SELECT count(*) FROM pg_policy WHERE polrelid=q.oid),
       (SELECT count(*) FROM pg_rewrite WHERE ev_class=q.oid),
       (SELECT array_agg(pg_get_constraintdef(oid) ORDER BY oid) FROM pg_constraint WHERE conrelid=q.oid),
-      has_table_privilege(current_user,q.oid,'INSERT'),
-      has_sequence_privilege(current_user,pg_get_serial_sequence('c360.c360_change_queue','id'),'USAGE')
+      has_table_privilege(CASE WHEN %s THEN pg_get_userbyid(m.relowner) ELSE current_user END,q.oid,'INSERT'),
+      has_sequence_privilege(CASE WHEN %s THEN pg_get_userbyid(m.relowner) ELSE current_user END,pg_get_serial_sequence('c360.c360_change_queue','id'),'USAGE')
       FROM pg_class q JOIN pg_namespace n ON n.oid=q.relnamespace
       CROSS JOIN pg_class m WHERE q.oid='c360.c360_change_queue'::regclass AND m.oid=%s::regclass""",
-      (relation,)).fetchone()
+      (observer,observer,relation)).fetchone()
     if checks != (True,0,0,0,["PRIMARY KEY (id)"],True,True):
         raise Blocked("C360_QUEUE_DEPENDENCIES_OR_PRIVILEGES")
     return 1

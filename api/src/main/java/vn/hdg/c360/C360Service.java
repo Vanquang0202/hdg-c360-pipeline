@@ -77,17 +77,31 @@ public class C360Service {
     }
     public Map<String,Object> changes(String value,String limitValue,String client) {
         int limit=limit(limitValue);
-        var now=OffsetDateTime.now(ZoneOffset.UTC);now=now.withNano(now.getNano()/1000*1000);
-        var c=value==null||value.isEmpty()?new CursorCodec.Cursor(OffsetDateTime.of(1,1,1,0,0,0,0,ZoneOffset.UTC),0,now.minusSeconds(120)):cursor.decode(value,client);
-        if(c.until().isAfter(now.minusSeconds(120)))throw new Failure(400,"INVALID_CURSOR_WINDOW");
-        var rows=repository.changes(c.date(),c.id(),c.until(),limit+1);
-        var items=new ArrayList<Map<String,Object>>();String next=null;
+        // Snapshot REPEATABLE READ giữ control/retention và payload nhất quán trong một request.
+        var state=repository.feedState();String feed=state.get("feed_id").toString();
+        long high=((Number)state.get("last_id")).longValue(),floor=((Number)state.get("retained_after")).longValue();
+        var c=value==null||value.isEmpty()?new CursorCodec.FeedCursor(feed,0,high):
+            value.equals("now")?new CursorCodec.FeedCursor(feed,high,high):cursor.decodeFeed(value,client);
+        if(!feed.equals(c.feed()))throw new Failure(410,"FEED_CHANGED_RESYNC_REQUIRED");
+        if(c.after()<floor)throw new Failure(410,"CURSOR_EXPIRED_RESYNC_REQUIRED");
+        if(c.until()>high)throw new Failure(409,"CURSOR_AHEAD_OF_FEED");
+        long until=c.after()==c.until()?high:c.until();
+        var rows=repository.feed(c.after(),until,limit+1);
+        var items=new ArrayList<Map<String,Object>>();long last=c.after();
         for(var r:rows.stream().limit(limit).toList()) {
-            var item=C360Repository.publicRow(r);item.put("id",r.get("id"));item.put("syncDate",CursorCodec.pythonTime(time(r.get("sync_date"))));items.add(item);
+            @SuppressWarnings("unchecked") var payload=(Map<String,Object>)r.get("payload");
+            var item=new LinkedHashMap<String,Object>(payload);
+            last=((Number)r.get("event_id")).longValue();
+            item.put("id",last);item.put("eventId",last);item.put("operation",r.get("operation"));
+            item.put("transactionId",r.get("transaction_id"));
+            item.put("syncDate",CursorCodec.pythonTime(time(r.get("occurred_at"))));items.add(item);
         }
-        if(rows.size()>limit){var last=rows.get(limit-1);next=cursor.encode(new CursorCodec.Cursor(time(last.get("sync_date")),((Number)last.get("id")).longValue(),c.until()),client);}
-        return map("status","OK","items",items,"nextCursor",next,"until",CursorCodec.pythonTime(c.until()),"consistency","BEST_EFFORT_CURRENT_ROWS",
-            "limitations",List.of("LATE_COMMIT_BARRIER_UNVERIFIED","DELETE_TOMBSTONES_NOT_AVAILABLE"));
+        boolean more=rows.size()>limit;
+        // Cursor luôn trả về, kể cả hết trang: client lưu để poll tiếp sau restart.
+        if(!more)last=until;
+        String next=cursor.encodeFeed(new CursorCodec.FeedCursor(feed,last,until),client);
+        return map("status","OK","items",items,"nextCursor",next,"until",until,"hasMore",more,
+            "feedId",feed,"retainedAfter",floor,"consistency","C360_COMMITTED_CHANGE_LOG","limitations",List.of("CLIENT_ACK_NOT_TRACKED"));
     }
     static OffsetDateTime time(Object value){return value instanceof OffsetDateTime d?d:((Timestamp)value).toInstant().atOffset(ZoneOffset.UTC);}
 }

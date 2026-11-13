@@ -219,12 +219,18 @@ def bootstrap():
 
 
 def verify(output=None):
-    # BƯỚC 3: Đăng nhập HTTP thật; truy vấn tất cả chart bằng tài khoản BI chỉ đọc.
+    checked_container()
+    return verify_http(assert_url(os.environ.get('HDG_SUPERSET_URL','http://localhost:8089')),
+                       os.environ['HDG_ADMIN_USERNAME'],os.environ['HDG_ADMIN_PASSWORD'],output)
+
+
+def verify_http(base, username, password, output=None):
+    # Cùng kiểm chứng dashboard/chart-data cho CLI và Airflow, chỉ cho phép instance HDG 8089.
     import urllib.request,urllib.parse,http.cookiejar
     from datetime import datetime,timezone
     from pathlib import Path
-    checked_container()
-    base=assert_url(os.environ.get('HDG_SUPERSET_URL','http://localhost:8089'))
+    if base not in ('http://localhost:8089','http://127.0.0.1:8089','http://host.docker.internal:8089'):
+        raise ValueError('HDG_BI_URL_REQUIRED')
     client=urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
     token=None
     def request(path,body=None,csrf=None):
@@ -235,13 +241,11 @@ def verify(output=None):
         req=urllib.request.Request(base+path,data=json.dumps(body).encode() if body is not None else None,headers=headers)
         with client.open(req,timeout=120) as response:
             return json.load(response)
-    login=request('/api/v1/security/login',dict(username=os.environ['HDG_ADMIN_USERNAME'],
-                  password=os.environ['HDG_ADMIN_PASSWORD'],provider='db',refresh=True))
+    login=request('/api/v1/security/login',dict(username=username,password=password,provider='db',refresh=True))
     token=login['access_token']
     csrf=request('/api/v1/security/csrf_token/')['result']
     # Đăng nhập form để kiểm tra chính URL dashboard, không nhầm trang login HTTP 200 thành thành công.
-    form=urllib.parse.urlencode(dict(username=os.environ['HDG_ADMIN_USERNAME'],
-         password=os.environ['HDG_ADMIN_PASSWORD'],csrf_token=csrf)).encode()
+    form=urllib.parse.urlencode(dict(username=username,password=password,csrf_token=csrf)).encode()
     with client.open(urllib.request.Request(base+'/login/',data=form),timeout=60) as r:
         if '/login' in r.url:raise ValueError('FORM_LOGIN_FAILED')
     csrf=request('/api/v1/security/csrf_token/')['result']

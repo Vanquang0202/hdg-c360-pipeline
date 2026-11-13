@@ -39,6 +39,11 @@ services:
       PG_USER: hdg_airflow_reader
       PG_PASSWORD: ${HDG_AIRFLOW_READER_PASSWORD:?Set airflow/.env}
       HDG_AIRFLOW_INSTANCE: hdg-c360
+      HDG_KAFKA_BOOTSTRAP: kafka:9092
+      HDG_C360_API_URL: http://host.docker.internal:8090
+      HDG_C360_API_KEY: ${HDG_C360_API_KEY:?Set airflow/.env}
+      HDG_SUPERSET_USERNAME: ${HDG_SUPERSET_USERNAME:?Set airflow/.env}
+      HDG_SUPERSET_PASSWORD: ${HDG_SUPERSET_PASSWORD:?Set airflow/.env}
     command: ["bash", "-c", "airflow db migrate && python /opt/airflow/init_local.py && (airflow webserver --port 8080 & airflow scheduler & wait -n)"]
     ports:
       - "127.0.0.1:8091:8080"
@@ -51,9 +56,18 @@ services:
       - ../jobs/schema_contract.py:/opt/hdg/jobs/schema_contract.py:ro
       - ../sql/oracle/01_create_source_tables.sql:/opt/hdg/sql/oracle/01_create_source_tables.sql:ro
       - ../tests/test_airflow.py:/opt/hdg/tests/test_airflow.py:ro
+      - ../cdc/sink/cutover.py:/opt/hdg/cdc/sink/cutover.py:ro
+      - ../cdc/sink/contract.py:/opt/hdg/cdc/sink/contract.py:ro
+      - ../cdc/sink/storage.py:/opt/hdg/cdc/sink/storage.py:ro
+      - ../cdc/sink/engine.py:/opt/hdg/cdc/sink/engine.py:ro
+      - ../cdc/sink/protocol.py:/opt/hdg/cdc/sink/protocol.py:ro
+      - ../cdc/sink/kafka_reader.py:/opt/hdg/cdc/sink/kafka_reader.py:ro
+      - ../sql/postgres/06_c360_incremental.sql:/opt/hdg/sql/postgres/06_c360_incremental.sql:ro
+      - ../jobs/c360_bi.py:/opt/hdg/jobs/c360_bi.py:ro
     depends_on:
       metadata2:
         condition: service_healthy
+    networks: [default, cdc]
     mem_limit: 1536m
     cpus: 1.5
     restart: unless-stopped
@@ -69,3 +83,8 @@ services:
 volumes:
   metadata2:
   logs2:
+
+networks:
+  cdc:
+    external: true
+    name: hdg-cdc-net

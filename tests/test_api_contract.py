@@ -13,7 +13,7 @@ def module(name,path):
 
 
 def main():
-    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--reference-dir',type=Path,default=ROOT);args=parser.parse_args()
+    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--reference-dir',type=Path,default=ROOT);parser.add_argument('--java-jar',type=Path,default=ROOT/'api/target/c360-api-1.0.0.jar');args=parser.parse_args()
     ref=args.reference_dir
     if not (ref/'api/app.py').exists() or not (ref/'tests/test_api.py').exists():
         raise SystemExit('BLOCKED: provide frozen Flask reference artifact with --reference-dir')
@@ -28,7 +28,7 @@ def main():
         def log_request(self,*a,**k):pass
     server=make_server('127.0.0.1',18091,python.create_app(fixture.connect,fixture.audit,secret),request_handler=Quiet)
     thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
-    jar=ROOT/'api/target/c360-api-1.0.0.jar';process=None;log=None
+    jar=args.java_jar.resolve();process=None;log=None
     def start(delay='100'):
         nonlocal process,log
         log=(out/('java-'+delay+'.log')).open('a',encoding='utf-8')
@@ -80,20 +80,8 @@ def main():
         for i,(name,dob) in enumerate([('Nguyễn Văn An','19950815'),('nguyen van an','19950815'),(' Nguyễn  Văn An ','1995'),('Nguyễn\u00a0Văn An','199508'),('Other','1995'),('An','19950230'),('','1995'),('An','19950000'),('An','0000'),('An','20000229')]):
             compare('search-'+str(i),'/api/v1/ca-nhan/tim-kiem?'+urllib.parse.urlencode({'hoTen':name,'ngaySinh':dob}))
         compare('search-truncated','/api/v1/ca-nhan/tim-kiem?'+urllib.parse.urlencode({'hoTen':'Nguyễn Văn An','ngaySinh':'1995','limit':'1'}))
-        for q in ['cursor=bad','limit=0','limit=1001','limit=','limit=-1','limit=1.0']:
-            compare('bad-page-'+q,'/api/v1/ca-nhan/thay-doi?'+q)
-        # Cùng watermark và HMAC secret: so JSON chính xác, bao gồm cursor và timestamp tới microsecond.
-        until=(datetime.now(timezone.utc)-timedelta(seconds=121)).isoformat()
-        c=python.encode_cursor(dict(date='0001-01-01T00:00:00+00:00',id=0,until=until,client='api-test'),secret)
+        # /thay-doi v2 cố ý đổi contract; kiểm bằng tests/test_change_feed.py và Java feed tests.
         pages=0
-        while c:
-            a,b=compare('shared-cursor-page-'+str(pages),'/api/v1/ca-nhan/thay-doi?limit=2&cursor='+urllib.parse.quote(c,safe=''))
-            c=b[1]['nextCursor'];pages+=1
-        a=call(18091,'/api/v1/ca-nhan/thay-doi?limit=2',key=fixture.key)
-        b=call(18090,'/api/v1/ca-nhan/thay-doi?limit=2',key=fixture.key)
-        assert a[0]==b[0]==200 and a[1]['items']==b[1]['items'] and a[1]['limitations']==b[1]['limitations']
-        compare('python-cursor-to-java','/api/v1/ca-nhan/thay-doi?limit=2&cursor='+urllib.parse.quote(a[1]['nextCursor'],safe=''))
-        compare('java-cursor-to-python','/api/v1/ca-nhan/thay-doi?limit=2&cursor='+urllib.parse.quote(b[1]['nextCursor'],safe=''))
         # Dừng/khởi động process Java thật với batch chưa flush: pending phải được giữ và replay idempotent.
         stop();start('3600000')
         call(18090,'/api/v1/ca-nhan/001',key=fixture.key)

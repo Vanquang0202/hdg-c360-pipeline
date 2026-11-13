@@ -227,7 +227,8 @@ def continuous_clone():
     with connect() as live:
      before=cutover.table_hashes(live)
      original=live.execute("SELECT plan FROM hdg_load.cutovers WHERE state='ACTIVE'").fetchone()[0]
-     history=read_ranges(original['manifest'],'127.0.0.1:29092')
+     with cutover.target(live,original,'hdg_mirror','status'):
+      history=read_ranges(original['manifest'],'127.0.0.1:29092')
      db='hdg_cutover_clone_'+uuid.uuid4().hex[:8]+'_test'
      live.execute(sql.SQL('CREATE DATABASE {} OWNER hdg_user').format(sql.Identifier(db)))
      dump=subprocess.run(['docker','exec','hdg-c360-postgres','pg_dump','-U','hdg_user','-d','hdg_mirror','-Fc'],capture_output=True,check=True).stdout
@@ -257,6 +258,13 @@ def continuous_clone():
       assert {(tp.topic,tp.partition):tp.offset for tp in offsets}=={(t,p):n for t,tid,p,n in cutover.checkpoints(c,plan['manifest']['epoch'])}
       if self.broken:raise KafkaException(KafkaError(KafkaError._TRANSPORT))
      def get_watermark_offsets(self,tp,timeout=None):return (0,visible[tp.topic])
+    from kafka_reader import native_metadata
+    from confluent_kafka.admin import AdminClient
+    native_cluster,native_ids,native_descriptions=native_metadata(AdminClient({'bootstrap.servers':'127.0.0.1:29092','broker.address.family':'v4'}),list(starts))
+    def fake_native(admin,topics):
+        ids={t:(native_ids[t] if b.ids[t]!='wrong-topic' else str(uuid.uuid4())) for t in topics}
+        descriptions={t:SimpleNamespace(topic_id=ids[t],partitions=[SimpleNamespace(id=0)]) for t in topics}
+        return native_cluster,ids,descriptions
     consumer=Consumer();admin=Admin();passed=[]
     def bounded(doc,bootstrap):
      return [r for r in all_records if any(r.topic==s['topic'] and s['start']<=r.offset<s['end'] for s in doc['streams'])]
@@ -265,7 +273,7 @@ def continuous_clone():
      nonlocal plan
      plan=current();plan,state=continuous.cycle(c,plan,admin,consumer,'unused',fail);return state
     def ok(name):passed.append(name);print('PASS '+name,flush=True)
-    with patch.object(continuous,'read_ranges',side_effect=bounded),patch.object(cutover,'read_ranges',side_effect=bounded),cutover.target(c,plan,db,'watch'):
+    with patch.object(continuous,'native_metadata',side_effect=fake_native),patch.object(continuous,'read_ranges',side_effect=bounded),patch.object(cutover,'read_ranges',side_effect=bounded),cutover.target(c,plan,db,'watch'):
      # Metadata END đầu tiên đã đến nhưng thiếu một DML: không được cập nhật manifest/checkpoint.
      first=[r for r in b.records if r.coordinate in {tuple(x) for x in b.frames[0]['records']}]
      for r in first:visible[r.topic]=max(visible[r.topic],r.offset+1)

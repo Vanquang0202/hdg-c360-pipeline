@@ -231,7 +231,7 @@ Các integration/E2E cần môi trường riêng và có ghi dữ liệu thử. 
 
 Đã có bằng chứng local cho Full Load/cutover Mirror, CDC bốn bảng, Full C360 **48.747 công dân** và incremental/rollback/replay trên database độc lập. Các bằng chứng máy local nằm trong `test-results/` được Git ignore.
 
-Chưa hoàn tất: Sink streaming liên tục; chính sách khoảng năm sinh và chuyển đổi điện thoại còn UNKNOWN; worker dừng khi danh mục đổi để tránh dùng Map cũ. BI có dashboard local ba nhóm KPI; xem mục dưới. REST API local và Airflow kiểm tra chỉ đọc đã có; các job ghi dữ liệu chưa đưa vào lịch. Watcher local chưa tự khởi động cùng Windows.
+Topic UUID Windows/Linux đã được kiểm chứng và ghim đầy đủ 128 bit; chính sách khoảng năm sinh và chuyển đổi điện thoại còn UNKNOWN; worker dừng khi danh mục đổi để tránh dùng Map cũ. BI có dashboard local ba nhóm KPI; xem mục dưới. REST API local và Airflow kiểm tra chỉ đọc đã có; các job ghi dữ liệu chưa đưa vào lịch. Watcher local chưa tự khởi động cùng Windows.
 
 
 ## Đối soát và Dashboard BI
@@ -256,7 +256,7 @@ Java 21 + Spring Boot 3.5.16 + Spring JDBC, build bằng Maven. URL `http://127.
 | `GET /api/v1/ca-nhan/{ma}` | Mã hiện hành → mã cũ → định danh; dừng tầng đầu tiên có kết quả. Không có: 404, trùng: 409. | `c360:lookup` |
 | `POST /api/v1/ca-nhan/tra-cuu-lo` | JSON `{"codes":["<ma>"]}`, 1–1000 mã; giữ thứ tự/mã lặp và trạng thái từng mã. | `c360:batch` |
 | `GET /api/v1/ca-nhan/tim-kiem?hoTen=...&ngaySinh=...` | Tên chính xác sau chuẩn hóa không dấu viết hoa; ngày YYYY/YYYYMM/YYYYMMDD hợp lịch, khớp phần cùng biết với ngày rút gọn. | `c360:search` |
-| `GET /api/v1/ca-nhan/thay-doi?limit=100&cursor=...` | Danh sách bản ghi còn tồn tại, cursor HMAC theo SYNC_DATE/ID và giữ cùng mốc `until` qua các trang. | `c360:changes` |
+| `GET /api/v1/ca-nhan/thay-doi?limit=100&cursor=...` | Journal C360 đã commit: UPSERT/DELETE, cursor HMAC theo event ID, trang có high-watermark cố định. | `c360:changes` |
 
 Mọi API cần `X-API-Key`. Thiếu/sai key: 401; thiếu scope: 403; input sai: 400; DB lỗi: 503. Hash và chữ ký cursor được so bằng constant-time comparison. Mã là chuỗi, giữ 0 đầu, dấu `;` và ký tự URL encoded; query dùng bind parameter. Không trả raw/source JSON. Conflict trả tối đa 100 mã ứng viên cùng `truncated`; search mặc định 100, tối đa 1000. Key và cursor secret cũ được giữ để client không phải đổi cấu hình. Không tìm từ ngày sinh ứng viên UNKNOWN, không tự ghép thông tin giữa các hộ.
 
@@ -316,11 +316,41 @@ FROM c360_api.c360_api_audit ORDER BY observed_at DESC LIMIT 20;
 SELECT client_id,scopes,enabled FROM c360_api.api_keys;
 ```
 
-39/39 test Java PASS. Contract HTTP trên DB test độc lập: 49/49 ca khớp, gồm 404/409, authentication/scope, URL encoded, dấu `;`, batch/search và cursor dùng chéo; process restart và Audit replay PASS. HTTP local và Audit đã được kiểm chứng, fingerprint C360 không đổi. Bằng chứng ở `test-results/c360-api/java-migration-b10713d9/` và `java-handoff-20261113/`.
+### Change feed C360 `/thay-doi`
 
-`tests/test_api_contract.py` chỉ là công cụ so sánh migration, không cần để chạy Java. Công cụ cần frozen Flask artifact được cung cấp qua `--reference-dir`, Python có Flask/psycopg và PostgreSQL test 15433. Khi thiếu artifact phải báo BLOCKED; không tự coi là PASS. Test tạo DB fixture mới, không reset DB giữ bằng chứng. Test Java thường chạy độc lập bằng Maven.
+`sql/postgres/09_c360_change_feed.sql` tạo `c360.change_feed_control`, `change_events` và hai trigger trên C360. Không đổi bốn bảng Mirror hoặc quy tắc chuẩn hóa. Migration chạy **một lần**: khóa C360, tạo feed, bootstrap mỗi công dân hiện có bằng một UPSERT rồi commit. Không chạy lại migration để reset feed. Backup trước khi cài nằm trong `test-results/change-feed/before-live.json`.
 
-**Giới hạn giữ nguyên:** `/thay-doi` vẫn là `BEST_EFFORT_CURRENT_ROWS`, cửa sổ 120s, chưa có commit fence/watermark hoặc tombstone. Không dùng như CDC feed đầy đủ. Tìm kiếm ngày sinh trên live có thể rỗng vì `NGAY_SINH_CHUAN` đang NULL/UNKNOWN; không dùng `NGAY_SINH_UNG_VIEN` để ép có kết quả. API chưa đăng ký tự khởi động cùng Windows. Không mở rộng Airflow hoặc E2E trong phần API.
+Trigger BEFORE STATEMENT khóa control trước row-lock, giữ tới commit; counter là UPDATE transactional, không dùng sequence ID để đoán thứ tự commit. Trigger AFTER ROW ghi payload API và DELETE tombstone cùng transaction C360. Rollback/retry không để lại event; UPDATE chỉ đổi `run_id`/`sync_date` hoặc không đổi payload công khai không phát thêm UPSERT. Đổi khóa phát DELETE mã cũ rồi UPSERT mã mới. TRUNCATE C360 bị chặn để không mất tombstone. Full/Incremental C360 dùng nguyên logic publish hiện có.
+
+Contract feed v2 trên cùng endpoint:
+
+- `items` giữ các trường công khai của ba API còn lại, thêm `operation`, `eventId`, `transactionId`, `syncDate`; `id` hiện là event ID, không phải row ID C360.
+- DELETE chỉ có `maSoBhxh`, `maSoBhxhCu` cùng metadata event, không mang họ tên/CCCD.
+- `until` hiện là số high-watermark, không còn timestamp. `nextCursor` luôn có, kể cả hết trang; `hasMore` cho biết còn trang trong cửa sổ. Khi cursor đã drain, request tiếp theo tự lấy high-watermark mới.
+- Cursor HMAC gắn `feedId`, client và phiên bản 2. Cursor cũ có chữ ký hợp lệ trả **409 CURSOR_VERSION_UNSUPPORTED**; giả mạo trả 400. Cursor quá retention hoặc đổi feed trả **410**, không âm thầm nhảy offset.
+- Không truyền cursor: đọc từ event 1, gồm bootstrap nếu còn retained. `cursor=now`: chỉ lấy cursor hiện tại, không trả lịch sử. Đây không tự động là snapshot dữ liệu khách hàng.
+- Để resync sau 410: lấy cursor `now`, xuất lại toàn bộ C360 bằng quy trình snapshot được phép, rồi replay từ cursor đã giữ; không ghép cursor legacy vào feed mới. Dữ liệu đã xóa trước khi feed được cài không có tombstone hồi tố; client cũ cần thay baseline.
+- Trang có thể chia một transaction; dùng `transactionId` nếu client cần gom nhóm. Client phải lưu cursor cùng dữ liệu local và dedup theo `(feedId,eventId)`. Server không ghi nhận ACK của client và không tuyên bố exactly-once phía client.
+
+Retention có kiểm soát: owner mới được gọi `SELECT c360.prune_change_events(30);`, mặc định 30 ngày, tối thiểu một ngày. Chỉ xóa prefix đã hết hạn, cập nhật `retained_after` trong cùng transaction/mutex. Chưa bật purge tự động; cần chốt chính sách lưu giữ và backup trước khi chạy. Không DELETE/TRUNCATE journal bằng tay, không sửa counter/feed ID.
+
+Ví dụ curl.exe chỉ đọc metadata (không in key hoặc PII):
+
+```powershell
+$key = ((Get-Content api/.env | Where-Object { $_ -match '^C360_API_KEY=' }) -split '=',2)[1].Trim().Trim('"').Trim("'")
+$config = 'header = "X-API-Key: ' + $key.Replace('\','\\').Replace('"','\"') + '"'
+$config | curl.exe --config - --silent --show-error --get "http://127.0.0.1:8090/api/v1/ca-nhan/thay-doi" --data-urlencode "cursor=now" --data-urlencode "limit=1"
+# Lưu page/cursor trong bộ nhớ, không dump dữ liệu công dân lên terminal:
+$page = $config | curl.exe --config - --silent --show-error --get "http://127.0.0.1:8090/api/v1/ca-nhan/thay-doi" --data-urlencode "limit=1000" | ConvertFrom-Json
+$cursor = $page.nextCursor
+$config | curl.exe --config - --silent --show-error --get "http://127.0.0.1:8090/api/v1/ca-nhan/thay-doi" --data-urlencode "cursor=$cursor" --data-urlencode "limit=1" --output test-results/feed-next-page.json
+```
+
+Build ứng viên không ghi đè JAR live: `mvn -f api/pom.xml -DskipTests -Dhdg.buildDirectory=E:/Projects/hdg-c360-pipeline/test-results/change-feed/java-build package`. JAR đang chạy nằm tại thư mục này; JVM dùng cùng secret/outbox Audit của project. JAR cũ giữ trong backup trước feed. Không chạy hai JVM dùng chung port/outbox.
+
+Kiểm thử: `mvn -f api/pom.xml test`; `cdc/sink/.venv/Scripts/python.exe tests/test_change_feed.py --run-clone` tạo DB test mới, không reset clone cũ. DB journal: 8/8 PASS (IUD, tombstone, concurrent late commit, REPEATABLE READ retry, hard crash, rollback, retention). HTTP clone: 6/6 PASS gồm pagination/restart/410/Audit. Ba API không đổi: 37 contract cases khớp Flask reference. Contract v2 thay thế các ca cursor legacy, không còn so cursor dùng chéo Flask/Java. Bằng chứng `test-results/change-feed/` và `test-results/c360-api/java-migration-7aa0da09/`.
+
+Giới hạn nghiệp vụ còn nguyên: ngày sinh/điện thoại UNKNOWN không tự suy đoán; feed phát đúng payload C360 hiện hành. API chưa tự start cùng Windows. Bootstrap live đã đọc đủ 48.747 khóa qua 49 trang. E2E Oracle IUD mới đã PASS qua continuous Sink, Watcher, API và BI: feed thêm UPSERT 48.748, UPSERT 48.749, DELETE tombstone 48.750; cursor limit=1/retry/restart Java không bỏ sót trong bài thử. Fixture đã dọn khỏi bảng hiện tại; lịch sử feed vẫn được giữ. Bằng chứng `test-results/topic-identity/e2e-result.json`.
 
 
 ## Airflow HDG local
@@ -332,21 +362,26 @@ Compose chạy webserver và scheduler trong một container, LocalExecutor vớ
 DAG `hdg_pipeline_checks`:
 
 ```text
-operation_guard → runtime_preflight → reconcile_c360 → read_only_complete
+operation_guard → runtime_preflight → await_mirror → await_c360
+  → reconcile_c360 → verify_feed → serving_checks → read_only_complete
 ```
 
 - `schedule=None`, paused khi tạo, `catchup=False`, một DagRun và một task chạy cùng lúc. Tài liệu chưa chốt lịch đối soát/Full Load nên không tự gán cron.
 - `operation_guard`: chỉ nhận `operation=verify`. Full Load/publish/cutover/replay/C360 full/incremental đều fail-fast trước I/O; không có task ghi dữ liệu ẩn phía sau nhánh verify.
-- `runtime_preflight`: kiểm instance, role chỉ SELECT và GET trạng thái Debezium Connector/task. RUNNING không phải bằng chứng SCN/offset barrier.
+- `runtime_preflight`: kiểm role chỉ đọc, Connector/task và Kafka; chụp vector offset hữu hạn qua XCom. Pin topic ID/partition theo epoch hiện tại; không bootstrap từ latest và không coi đây là Oracle SCN barrier.
+- `await_mirror`: sensor `reschedule` chờ checkpoint đạt vector đã chụp; kiểm schema, ownership/ACL, sealed content, epoch/handoff, lock Sink và quarantine. Chỉ quan sát, không replay hay sửa checkpoint.
+- `await_c360`: sensor chờ Queue rỗng, Watcher giữ lock và catalog digest đúng. Không khởi động vòng lặp worker trong PythonOperator.
+- `verify_feed`: kiểm control/retention và dải event không có gap.
+- `serving_checks`: gọi Java feed bằng API Key/scope, rồi đăng nhập đúng Superset HDG 8089 và query 10 chart-data thật. Không dùng health HTTP 200 thay cho kết quả dữ liệu.
 - `reconcile_c360`: chạy nguyên CLI `jobs/c360_reconcile.py`, không chép lại lọc/dedup/normalize/DQ. PASS_WITH_UNKNOWN là khớp kỹ thuật nhưng còn quy tắc UNKNOWN. FAIL dừng ngay; BLOCKED/transient retry tối đa hai lần, cách một phút.
-- `read_only_complete`: báo hoàn tất kiểm tra đọc, không phải pipeline E2E hoặc publish đã thành công.
-- Timeout mỗi task 10 phút, subprocess đối soát 9 phút, DagRun 35 phút. Pool `hdg_read_only` có một slot. Pool chỉ kiểm soát task Airflow, không thay khóa DB hoặc fence của writer bên ngoài.
+- `read_only_complete`: chỉ chạy sau mọi bước bắt buộc; kết luận đạt Kafka goal đã quan sát, không phải Oracle quiescent barrier hoặc nghiệm thu production.
+- Sensor poke 10 giây, timeout 180 giây, không soft-fail. Task mặc định retry 2 lần cách một phút; service dừng, lag hết timeout, schema/identity/quarantine sai hoặc reconciliation lỗi sẽ chặn downstream. Timeout mỗi task 10 phút, subprocess đối soát 9 phút, DagRun 35 phút. Pool `hdg_read_only` có một slot. Pool chỉ kiểm soát task Airflow, không thay khóa DB hoặc fence của writer bên ngoài.
 
 ### Cấu hình và chạy
 
 `airflow/.env` giữ metadata password, mật khẩu `hdg_airflow_reader`, Fernet và webserver secret. File auth được mount readonly. `init_local.py` chỉ tạo admin/pool nếu chưa có trên metadata 2, không reset mật khẩu khi restart. Secret không được gửi vào build context, argv hoặc log. Không cấp thêm quyền Mirror.
 
-Role `hdg_airflow_reader` chỉ SELECT bốn Mirror và các bảng C360 cần đối soát, mặc định transaction READ ONLY. Không mount `jobs/.env`, API Key, BI credentials hoặc Docker socket vào Airflow. Cấu hình hiện tại dùng TCP proxy `127.0.0.1:15432` bên trong namespace container → `host.docker.internal:15432`, để giữ nguyên guard localhost trong code C360. Proxy không publish cổng host và không thay network/container PostgreSQL hiện có.
+Role `hdg_airflow_reader` chỉ SELECT bốn Mirror và các bảng C360 cần đối soát, mặc định transaction READ ONLY. Không mount `jobs/.env`, `api/.env`, `bi/.env`, `.env.test` hoặc Docker socket. Credential HTTP cần thiết được đặt trong `airflow/.env` với `HDG_C360_API_KEY`, `HDG_SUPERSET_USERNAME`, `HDG_SUPERSET_PASSWORD`; không log giá trị. Kafka đọc qua external network `hdg-cdc-net`. Cấu hình hiện tại dùng TCP proxy `127.0.0.1:15432` bên trong namespace container → `host.docker.internal:15432`, để giữ nguyên guard localhost trong code C360. Proxy không publish cổng host và không thay network/container PostgreSQL hiện có.
 
 ```powershell
 docker compose --env-file airflow/.env -f airflow/compose.yaml up -d --build
@@ -356,7 +391,7 @@ docker exec hdg-c360-airflow python /opt/hdg/tests/test_airflow.py -v
 docker exec hdg-c360-airflow airflow dags test hdg_pipeline_checks
 ```
 
-Xem DAG list/Grid/Graph tại UI. `dags test` chỉ ghi metadata/log Airflow. DAG mặc định paused, `schedule=None`. Với manual run qua scheduler, unpause tạm → trigger với `operation=verify` → chờ đủ bốn task success → pause lại. Unpause không tạo cron hay mở đường ghi dữ liệu.
+Xem DAG list/Grid/Graph tại UI. `dags test` chỉ ghi metadata/log Airflow. DAG mặc định paused, `schedule=None`. Với manual run qua scheduler, unpause tạm → trigger với `operation=verify` → chờ đủ tám task success → pause lại. Unpause không tạo cron hay mở đường ghi dữ liệu.
 
 Dừng/start lại Airflow 2 (không xóa volume):
 
@@ -394,6 +429,28 @@ Rollback dùng nguyên metadata 3 cũ, không restore dump đè lên metadata 2.
 
 Nhánh ghi dữ liệu hiện BLOCKED trong Airflow. Đây là giới hạn triển khai, không phải các entrypoint Full Load/CDC/C360 cũ bị lỗi. Trước khi bật lịch thật cần chốt tần suất, runner Spark, cơ chế loại trừ writer ngoài Airflow và diễn tập rerun/cancellation với guard hiện có. Chỉ unpause DAG kiểm tra không bật được những job ghi này. Không coi `max_active_runs=1` là bảo vệ checkpoint giữa Airflow và lệnh chạy tay.
 
-Bằng chứng Airflow nằm trong `test-results/airflow/`; kết quả import/dependency/guard và task chỉ đọc được báo riêng, không dùng làm PASS cho Full Load/cutover/replay. Chưa thực hiện E2E toàn trình.
+Bằng chứng Airflow 2 hiện tại nằm trong `test-results/topic-identity/airflow/`: manual run `manual__hdg_pipeline_bc899557` SUCCESS 8/8, log từng task có exit code 0, reconciliation PASS_WITH_UNKNOWN, API và 10 chart-data PASS. DAG đã paused lại. Không chạy Full Load/cutover trong bài thử này.
 
-Kiểm thử Airflow 2.10.5: 5/5 test DAG PASS; manual run `manual__hdg_airflow2_324629f9` qua scheduler đạt 4/4 task success, reconciliation `PASS_WITH_UNKNOWN`, 0 sai khác. DAG đã paused lại, lịch vẫn None. DAG list/Grid/Graph và đăng nhập HDG trả HTTP 200. Bằng chứng: `test-results/airflow2/run.json`, `reconcile.json`, `services-after.json`, `summary.json`. Các job ghi pipeline chưa được bật qua Airflow. Tài liệu image/Docker chính thức: [Airflow 2.10.5](https://airflow.apache.org/docs/apache-airflow/2.10.5/howto/docker-compose/index.html).
+Regression DAG hiện tại: **11/11 PASS**, gồm dependency, guard ghi, service dừng, lag, identity mismatch, timeout và reconciliation sai. Toàn DAG kiểm tra đã chạy thủ công thành công; continuous Sink/Watcher vẫn là service bên ngoài DAG, không chạy vòng lặp vô hạn trong task.
+
+### Kafka Topic UUID trên Windows và Linux
+
+SDK Windows 2.16.1 đã trả UUID với hai nửa 64 bit bị thu về signed 32 bit rồi sign-extend. Đổi Base64 thông thường sang Base64 URL-safe không khôi phục được bit đã mất. `kafka_reader.py` đọc UUID đầy đủ bằng Kafka CLI Java trong container Kafka local trên Windows; Linux dùng metadata SDK. Hai cách được chuẩn hóa về Base64 URL-safe 22 ký tự, giữ đủ 128 bit. CLI phải trỏ cùng cluster ID; không có fallback chấp nhận UUID rút gọn.
+
+Identity cũ trong checkpoint/manifest/inbox được giữ nguyên để không đổi wire hash và lịch sử replay. Bảng bổ sung `sink_meta.topic_identity_bindings` ghim cặp legacy/native theo epoch và cluster. Mỗi cặp phải có proof SHA256: lịch sử KRaft từ offset 0, đúng một lần tạo topic trước cutover, không xóa/tạo lại, cùng UUID hiện tại, toàn bộ prefix Kafka khớp inbox và fingerprint transaction/frame. Topic đổi dù chỉ bit cao vẫn bị chặn.
+
+Diễn tập clone đạt 10/10 kiểm tra, gồm cài lỗi rollback nguyên tử, revoke fail-closed, sửa proof bị chặn và replay lịch sử không đổi dữ liệu/checkpoint/seal. Binding local được cài sau backup tại `backups/topic-identity-20261113-151618`; bằng chứng và plan/proof nằm trong `test-results/topic-identity/` (Git ignore). Không restore dump metadata đè lên checkpoint đang tiến.
+
+Nếu cần rollback binding: dừng Sink bằng stop-file, chờ writer lock được nhả, rồi chạy lệnh bên dưới. Lệnh chỉ revoke binding và khiến writer/preflight fail-closed; không tua lại dữ liệu hoặc offsets. Giữ nguyên code đọc UUID đầy đủ khi rollback. Chỉ re-enable sau khi proof gốc và toàn bộ prefix hiện tại được xác minh lại.
+
+```powershell
+cdc/sink/.venv/Scripts/python.exe cdc/sink/cutover.py rollback-identities --plan test-results/topic-identity/plan.json --confirm-database hdg_mirror --identity-proof test-results/topic-identity/proof.json
+# Re-enable bằng proof gốc sau khi nguyên nhân đã được kiểm tra; không sửa checkpoint/seal:
+cdc/sink/.venv/Scripts/python.exe cdc/sink/cutover.py bind-identities --plan test-results/topic-identity/plan.json --confirm-database hdg_mirror --identity-proof test-results/topic-identity/proof.json
+```
+
+Windows hiện cần Docker CLI và container Kafka `hdg-cdc-kafka-1` để lấy UUID native. Migration tự động bị chặn nếu thiếu lịch sử KRaft gốc hoặc prefix Kafka đã hết retention; không suy nguồn gốc topic từ tên/offset trùng nhau.
+
+Khi service dừng: kiểm tra đúng task đỏ/log tại <http://127.0.0.1:8091/dags/hdg_pipeline_checks/grid>, sửa nguyên nhân rồi start lại worker theo phần CDC/C360; không reset Connector/epoch/offset. Khi lag: xem checkpoint so goal trong XCom, để sensor retry hữu hạn; timeout vẫn fail. Khi reconciliation sai/quarantine: dừng nghiệm thu, giữ bằng chứng, không publish/cutover để che sai khác. Full Load/cutover vẫn là thao tác riêng có fence/backup; không tự chạy từ DAG này.
+
+Kết quả E2E local sau sửa UUID: 3 DML Oracle mới (commit SCN 6112124 / 6113011 / 6114196), Kafka nhân khẩu [24,28), transaction [36,42); ba topic danh mục vẫn offset 16. PostgreSQL checkpoint bằng Kafka consumer committed offset; inbox/frame/transaction/event ledger đã đối chiếu fingerprint. Mirror trở lại 50.000, C360 48.747, Queue/quarantine 0; hash cả bốn Mirror bằng baseline trước fixture và đối soát C360 không sai khác. Đây là bằng chứng demo local, chưa chứng minh tải/độ trễ production hay exactly-once phía client. Việc lấy UUID bằng CLI Windows tăng chi phí mỗi batch; chưa benchmark tải lớn.

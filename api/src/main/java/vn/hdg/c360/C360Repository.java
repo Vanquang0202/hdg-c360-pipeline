@@ -13,7 +13,8 @@ public class C360Repository {
     static final String[] JSON={"maSoBhxh","maSoBhxhCu","hoTen","ngaySinh","soDinhDanh","soDienThoai","gioiTinh","isAlive","maTinh","maXa","danToc","quocTich","dqFlags","normalizationStatus"};
     static final String SELECT=String.join(",",COLUMNS);
     private final JdbcTemplate jdbc;
-    public C360Repository(JdbcTemplate jdbc){this.jdbc=jdbc;}
+    private final com.fasterxml.jackson.databind.ObjectMapper json;
+    public C360Repository(JdbcTemplate jdbc,com.fasterxml.jackson.databind.ObjectMapper json){this.jdbc=jdbc;this.json=json;}
     public List<Map<String,Object>> lookup(String column,String code) {
         // Tên cột chỉ từ allowlist nội bộ; dữ liệu client luôn là bind parameter.
         if(!Set.of("ma_so_bhxh","ma_so_bhxh_cu","so_dinh_danh").contains(column))throw new IllegalArgumentException();
@@ -26,6 +27,15 @@ public class C360Repository {
     }
     public List<Map<String,Object>> changes(OffsetDateTime low,long id,OffsetDateTime until,int limit) {
         return jdbc.queryForList("SELECT "+SELECT+",id,sync_date FROM "+TABLE+" WHERE (sync_date,id)>(?,?) AND sync_date<=? ORDER BY sync_date,id LIMIT ?",low,id,until,limit);
+    }
+    public Map<String,Object> feedState() {
+        return jdbc.queryForMap("SELECT feed_id,last_id,retained_after FROM c360.change_feed_control WHERE singleton");
+    }
+    public List<Map<String,Object>> feed(long after,long until,int limit) {
+        var rows=jdbc.queryForList("SELECT event_id,operation,payload,occurred_at,transaction_id FROM c360.change_events WHERE event_id>? AND event_id<=? ORDER BY event_id LIMIT ?",after,until,limit);
+        for(var row:rows)try {row.put("payload",json.readValue(row.get("payload").toString(),Map.class));}
+        catch(Exception e){throw new org.springframework.dao.DataRetrievalFailureException("INVALID_FEED_PAYLOAD");}
+        return rows;
     }
     @Transactional(readOnly=true,timeout=5)
     public List<Map<String,Object>> key(String hash) {

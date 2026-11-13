@@ -11,7 +11,7 @@ import cutover
 import engine
 import storage
 from protocol import decode, Rejected
-from kafka_reader import read_ranges
+from kafka_reader import read_ranges, native_metadata, assert_topic
 
 MAX_RECORDS = 5000
 MAX_MANIFEST_BYTES = 32 * 1024 * 1024
@@ -104,13 +104,13 @@ def cycle(connection, plan, admin, consumer, bootstrap, failpoint=None):
         cutover.replay(connection,plan,index,failpoint)
     cp=cutover.checkpoints(connection,plan['manifest']['epoch'])
     # ACK offset Kafka chỉ sau PostgreSQL đã commit; lỗi ACK được retry bằng DB checkpoint.
-    futures=admin.describe_topics(TopicCollection([s['topic'] for s in plan['manifest']['streams']]))
+    cluster,ids,descriptions=native_metadata(admin,[s['topic'] for s in plan['manifest']['streams']])
     ranges=[]
     for t,tid,p,n in cp:
-        description=futures[t].result(timeout=10)
-        cutover.require(str(description.topic_id)==tid,'KAFKA_TOPIC_ID_MISMATCH')
+        description=descriptions[t]
         # Manifest local chỉ có partition 0: thêm partition phải dừng, không bỏ mất event mới.
         cutover.require(p==0 and {part.id for part in description.partitions}=={0},'WATCH_PARTITION_LAYOUT_CHANGED')
+        assert_topic(t,tid,ids[t],cluster)
         lo,hi=consumer.get_watermark_offsets(TopicPartition(t,p),timeout=10)
         cutover.require(lo<=n<=hi,'KAFKA_RANGE_UNAVAILABLE')
         ranges.append(dict(topic=t,topic_id=tid,partition=p,start=n,end=hi))
