@@ -207,5 +207,121 @@ def main():
     print(json.dumps(report),flush=True)
 
 
+
+def continuous_clone():
+    import sys,json,copy,uuid,subprocess
+    from pathlib import Path
+    from unittest.mock import patch
+    from types import SimpleNamespace
+    ROOT=Path.cwd();sys.path[:0]=[str(ROOT/'jobs'),str(ROOT/'cdc/sink')]
+    import psycopg
+    from psycopg import sql
+    from psycopg.types.json import Jsonb
+    import cutover,continuous,engine
+    from c360_full_load import connect
+    from fixtures import Builder,image
+    from kafka_reader import read_ranges
+    from protocol import Rejected
+    from confluent_kafka import KafkaException,KafkaError
+    out=ROOT/'test-results/continuous-20261113'
+    with connect() as live:
+     before=cutover.table_hashes(live)
+     original=live.execute("SELECT plan FROM hdg_load.cutovers WHERE state='ACTIVE'").fetchone()[0]
+     history=read_ranges(original['manifest'],'127.0.0.1:29092')
+     db='hdg_cutover_clone_'+uuid.uuid4().hex[:8]+'_test'
+     live.execute(sql.SQL('CREATE DATABASE {} OWNER hdg_user').format(sql.Identifier(db)))
+     dump=subprocess.run(['docker','exec','hdg-c360-postgres','pg_dump','-U','hdg_user','-d','hdg_mirror','-Fc'],capture_output=True,check=True).stdout
+     restore=subprocess.run(['docker','exec','-i','hdg-c360-postgres','pg_restore','-U','hdg_user','-d',db],input=dump,capture_output=True)
+     if restore.returncode:raise RuntimeError('Clone restore failed; no live writes')
+     cfg=live.info.get_parameters();cfg.update(dbname=db,password=__import__('os').environ['PG_PASSWORD']);cfg.pop('options',None)
+     c=psycopg.connect(**cfg,autocommit=True)
+    plan=copy.deepcopy(original);plan['purpose']='clone-rehearsal';plan['target']['database']=db;plan['manifest']['mode']='captured-fixture-test';plan['manifest']['baseline']['assertion']='verified-test-baseline'
+    c.execute('UPDATE hdg_load.cutovers SET plan=%s,before_ownership=%s WHERE id=%s',(Jsonb(plan),Jsonb(cutover.ownership(c)),plan['id']))
+    c.execute('UPDATE sink_meta.epochs SET manifest=%s,manifest_hash=%s WHERE epoch=%s',(Jsonb(plan['manifest']),engine.manifest_hash(plan['manifest']),plan['manifest']['epoch']))
+    starts={s['topic']:s['end'] for s in plan['manifest']['streams']};b=Builder();b.prefix='hdg_observe';b.starts=dict(starts);b.next=dict(starts);b.ids={s['topic']:s['topic_id'] for s in plan['manifest']['streams']}
+    a=image('VSS_HO_GD_NHANKHAU',id='WATCHCLONE00000001',ma_cd='WATCHCLONE00000001',ho_ten='Clone',typeid='CD',trang_thai_duyet=2)
+    u=dict(a,ho_ten='Clone updated')
+    base=int(c.execute('SELECT last_commit_scn FROM sink_meta.epochs WHERE epoch=%s',(plan['manifest']['epoch'],)).fetchone()[0])+100
+    b.transaction([('VSS_HO_GD_NHANKHAU','c',None,a),('VSS_HO_GD_NHANKHAU','u',a,u)],commit=base)
+    b.transaction([('VSS_HO_GD_NHANKHAU','d',u,None)],commit=base+100,tombstone=True)
+    all_records=history+b.records
+    visible=dict(starts)
+    class Future:
+     def __init__(self,t):self.t=t
+     def result(self,timeout=None):return SimpleNamespace(topic_id=b.ids[self.t],partitions=[SimpleNamespace(id=0)])
+    class Admin:
+     def describe_topics(self,topics):return {t:Future(t) for t in starts}
+    class Consumer:
+     broken=False
+     def commit(self,offsets,asynchronous=False):
+      assert {(tp.topic,tp.partition):tp.offset for tp in offsets}=={(t,p):n for t,tid,p,n in cutover.checkpoints(c,plan['manifest']['epoch'])}
+      if self.broken:raise KafkaException(KafkaError(KafkaError._TRANSPORT))
+     def get_watermark_offsets(self,tp,timeout=None):return (0,visible[tp.topic])
+    consumer=Consumer();admin=Admin();passed=[]
+    def bounded(doc,bootstrap):
+     return [r for r in all_records if any(r.topic==s['topic'] and s['start']<=r.offset<s['end'] for s in doc['streams'])]
+    def current():return c.execute('SELECT plan FROM hdg_load.cutovers WHERE id=%s',(plan['id'],)).fetchone()[0]
+    def cycle(fail=None):
+     nonlocal plan
+     plan=current();plan,state=continuous.cycle(c,plan,admin,consumer,'unused',fail);return state
+    def ok(name):passed.append(name);print('PASS '+name,flush=True)
+    with patch.object(continuous,'read_ranges',side_effect=bounded),patch.object(cutover,'read_ranges',side_effect=bounded),cutover.target(c,plan,db,'watch'):
+     # Metadata END đầu tiên đã đến nhưng thiếu một DML: không được cập nhật manifest/checkpoint.
+     first=[r for r in b.records if r.coordinate in {tuple(x) for x in b.frames[0]['records']}]
+     for r in first:visible[r.topic]=max(visible[r.topic],r.offset+1)
+     old_cp=cutover.checkpoints(c,plan['manifest']['epoch']);old_hash=cutover.table_hashes(c)
+     missing=first[2];all_records.remove(missing)
+     assert cycle()=='WAITING_TRANSACTION';assert old_cp==cutover.checkpoints(c,plan['manifest']['epoch']);all_records.append(missing);ok('incomplete_transaction_no_checkpoint')
+     def fail(point):
+      if point=='before_commit':raise RuntimeError('CRASH_BEFORE_COMMIT')
+     try:cycle(fail);raise AssertionError('No crash')
+     except RuntimeError as ex:assert str(ex)=='CRASH_BEFORE_COMMIT'
+     assert cutover.table_hashes(c)==old_hash and cutover.checkpoints(c,plan['manifest']['epoch'])==old_cp;ok('crash_before_commit_atomic_rollback')
+     # Restart/resume pending manifest, rồi crash sau commit trước Kafka ACK.
+     def after(point):
+      if point=='after_commit':raise RuntimeError('CRASH_AFTER_COMMIT')
+     try:cycle(after);raise AssertionError('No crash')
+     except RuntimeError as ex:assert str(ex)=='CRASH_AFTER_COMMIT'
+     assert c.execute('SELECT count(*) FROM public.mirror_hdg_nhankhau WHERE id=%s',(a['id'],)).fetchone()[0]==1;ok('multi_event_transaction_atomic_apply')
+     cp=cutover.checkpoints(c,plan['manifest']['epoch']);assert cp!=old_cp
+     assert cycle()=='IDLE' and cutover.checkpoints(c,plan['manifest']['epoch'])==cp;ok('restart_after_commit_idempotent')
+     consumer.broken=True
+     try:cycle();raise AssertionError('Expected Kafka outage')
+     except KafkaException:pass
+     assert cutover.checkpoints(c,plan['manifest']['epoch'])==cp;consumer.broken=False
+     assert cycle()=='IDLE';ok('kafka_ack_failure_recovery')
+     other=psycopg.connect(**cfg,autocommit=True)
+     try:
+      try:
+       with cutover.target(other,plan,db,'replay'):raise AssertionError('Second writer admitted')
+      except Rejected as ex:assert ex.code=='SINK_WRITER_ALREADY_RUNNING'
+     finally:other.close()
+     ok('two_writer_sessions_blocked')
+     for statement,label in [('GRANT UPDATE ON public.mirror_hdg_nhankhau TO hdg_airflow_reader','ownership'),('ALTER TABLE public.mirror_hdg_nhankhau ALTER COLUMN id TYPE varchar(200)','schema')]:
+      with c.transaction(force_rollback=True):
+       c.execute(statement)
+       try:continuous.inspect(c,current());raise AssertionError('Guard accepted')
+       except (Rejected,psycopg.Error):pass
+      ok(label+'_guard_blocks')
+     bad=copy.deepcopy(current());bad['manifest']['epoch']=str(uuid.uuid4())
+     try:continuous.inspect(c,bad);raise AssertionError('Bad epoch accepted')
+     except Rejected:pass
+     ok('epoch_guard_blocks')
+     original_id=b.ids[next(iter(starts))];topic=next(iter(starts));b.ids[topic]='wrong-topic'
+     try:cycle();raise AssertionError('Wrong topic accepted')
+     except Rejected as ex:assert ex.code=='KAFKA_TOPIC_ID_MISMATCH'
+     b.ids[topic]=original_id;ok('topic_id_guard_blocks')
+     for r in b.records:visible[r.topic]=max(visible[r.topic],r.offset+1)
+     assert cycle()=='APPLIED';assert cutover.table_hashes(c)==old_hash;ok('automatic_delete_tombstone')
+     cp=cutover.checkpoints(c,plan['manifest']['epoch']);assert cycle()=='IDLE' and cutover.checkpoints(c,plan['manifest']['epoch'])==cp;ok('idle_restart_dedup')
+     assert c.execute('SELECT count(*) FROM sink_meta.quarantine').fetchone()[0]==0
+    with connect() as live:assert cutover.table_hashes(live)==before
+    result=dict(status='PASS',clone=db,tests=passed,passed=len(passed),transport='Injected records and transport errors; real PostgreSQL clone and guards',checkpoint=cutover.checkpoints(c,plan['manifest']['epoch']),live_unchanged=True)
+    (out/'clone-result.json').write_text(json.dumps(result,indent=2),encoding='utf-8');print(json.dumps(result));c.close()
+
+
 if __name__=="__main__":
-    main()
+    if "--continuous-clone" in sys.argv:
+        continuous_clone()
+    else:
+        main()

@@ -150,9 +150,17 @@ def target(connection, plan, confirmation, command, rollback_proof=None):
             row = connection.execute("SELECT state FROM hdg_load.cutovers WHERE id=%s",(plan["id"],)).fetchone()
             require(row and (row[0] == "ACTIVE" or command == "status"), "LIVE_NOT_ACTIVATED")
         checked = True
-    with storage.cutover_target(connection,plan["target"]["database"],confirmation,purpose,checked):
-        engine.validate(plan["manifest"])
-        yield
+    # Một writer/session cho watch, replay, extend và cutover; lock tự nhả khi process chết.
+    writer = command != "status"
+    if writer:
+        require(connection.execute("SELECT pg_try_advisory_lock(631874,2)").fetchone()[0], "SINK_WRITER_ALREADY_RUNNING")
+    try:
+        with storage.cutover_target(connection,plan["target"]["database"],confirmation,purpose,checked):
+            engine.validate(plan["manifest"])
+            yield
+    finally:
+        if writer and not connection.closed:
+            connection.execute("SELECT pg_advisory_unlock(631874,2)")
 
 
 def locks(connection):
@@ -185,6 +193,48 @@ def ownership(connection):
         "FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
         "WHERE n.nspname='public' AND c.relname=ANY(%s) ORDER BY c.relname",
         ([t["mirror"] for t in TABLES.values()],)).fetchall()
+
+
+def ownership_matches(connection, expected):
+    # Giữ nguyên seal; chỉ cho phép thêm SELECT không grant option cho role Airflow.
+    current = ownership(connection)
+    if len(current) != 4 or len(expected) != 4:
+        return False
+    reader = connection.execute("SELECT oid,rolsuper,rolcreaterole,rolcreatedb,rolcanlogin,rolreplication,rolbypassrls FROM pg_roles WHERE rolname='hdg_airflow_reader'").fetchone()
+    def acl(raw, owner):
+        return set(connection.execute("SELECT grantor,grantee,privilege_type,is_grantable FROM aclexplode(coalesce(%s::aclitem[],acldefault('r',%s::oid)))", (raw,owner)).fetchall())
+    allowed_reader = False
+    for actual, sealed in zip(current, expected):
+        if tuple(actual[:3])+tuple(actual[4:]) != tuple(sealed[:3])+tuple(sealed[4:]):
+            return False
+        owner = connection.execute("SELECT oid FROM pg_roles WHERE rolname=%s", (sealed[2],)).fetchone()[0]
+        before, after = acl(sealed[3],owner), acl(actual[3],owner)
+        extra = {(owner,reader[0],'SELECT',False)} if reader else set()
+        if after != before and (not extra or after != before | extra):
+            return False
+        if reader and any(x[1] == reader[0] for x in after):
+            allowed_reader = True
+            if {x for x in after if x[1] == reader[0]} != extra:
+                return False
+    if not allowed_reader:
+        return True
+    if reader[1:] != (False,False,False,True,False,False):
+        return False
+    oid = reader[0]
+    if connection.execute("SELECT EXISTS(SELECT 1 FROM pg_auth_members WHERE member=%s OR roleid=%s)", (oid,oid)).fetchone()[0]:
+        return False
+    if connection.execute("SELECT has_database_privilege(%s,current_database(),'CREATE') OR has_schema_privilege(%s,'public','CREATE')", (oid,oid)).fetchone()[0]:
+        return False
+    for actual in current:
+        table = actual[1]
+        if connection.execute("SELECT EXISTS(SELECT 1 FROM pg_attribute WHERE attrelid=%s AND attacl IS NOT NULL)",(table,)).fetchone()[0]:
+            return False
+        if not connection.execute("SELECT has_table_privilege(%s,%s,'SELECT')",(oid,table)).fetchone()[0]:
+            return False
+        for privilege in ('INSERT','UPDATE','DELETE','TRUNCATE','REFERENCES','TRIGGER'):
+            if connection.execute("SELECT has_table_privilege(%s,%s,%s)",(oid,table,privilege)).fetchone()[0]:
+                return False
+    return True
 
 
 def safe_schema(connection):
@@ -302,13 +352,13 @@ def apply(connection, plan, failpoint=None):
         row = record(connection,plan)
         if row[1] == "ACTIVE":
             assert_handoff(connection,plan)
-            require(canonical(ownership(connection))==row[5],"OWNERSHIP_ACL_OR_OID_CHANGED")
+            require(ownership_matches(connection,row[5]),"OWNERSHIP_ACL_OR_OID_CHANGED")
             control=connection.execute("SELECT cdc_enabled,last_run_id FROM hdg_load.control WHERE id=1").fetchone()
             require(control==(True,plan["run_id"]), "HANDOFF_CONTROL")
             require(table_hashes(connection)==row[8],"ACTIVE_MIRROR_CHANGED")
             return "ALREADY_ACTIVE"
         require(row[1]=="PREPARED","CUTOVER_STATE")
-        require(canonical(ownership(connection))==row[5],"OWNERSHIP_ACL_OR_OID_CHANGED")
+        require(ownership_matches(connection,row[5]),"OWNERSHIP_ACL_OR_OID_CHANGED")
         require(table_hashes(connection)==row[4],"MIRROR_CHANGED_SINCE_PREPARE")
         require(table_hashes(connection,row[2])==row[7] and table_hashes(connection,row[3])==row[4],"PREPARED_DATA_CHANGED")
         require(not connection.execute("SELECT 1 FROM sink_meta.epochs WHERE state='ACTIVE'").fetchone(),"SINK_EPOCH_ACTIVE")
@@ -318,7 +368,7 @@ def apply(connection, plan, failpoint=None):
             connection.execute(sql.SQL("INSERT INTO {} SELECT * FROM {}").format(storage.relation(t),sql.Identifier(row[2],t["mirror"])))
         engine._register_epoch(connection,plan["manifest"])
         connection.execute("UPDATE hdg_load.control SET cdc_enabled=true,bootstrap_published=true,last_run_id=%s WHERE id=1",(plan["run_id"],))
-        require(table_hashes(connection)==row[7] and canonical(ownership(connection))==row[5],"PUBLISH_RECONCILE")
+        require(table_hashes(connection)==row[7] and ownership_matches(connection,row[5]),"PUBLISH_RECONCILE")
         connection.execute("UPDATE hdg_load.cutovers SET state='ACTIVE',last_data=shadow_data WHERE id=%s",(plan["id"],))
         if failpoint: failpoint("before_commit")
     if failpoint: failpoint("after_commit")
@@ -338,7 +388,7 @@ def begin_frame(connection, plan):
         connection.execute(sql.SQL("LOCK TABLE {} IN SHARE ROW EXCLUSIVE MODE").format(storage.relation(t)))
     row=record(connection,plan)
     require(row[1]=="ACTIVE" and table_hashes(connection)==row[8], "MIRROR_EXTERNAL_CHANGE")
-    require(canonical(ownership(connection))==row[5], "OWNERSHIP_CHANGED")
+    require(ownership_matches(connection,row[5]), "OWNERSHIP_CHANGED")
 
 def replay(connection, plan, frame=None, failpoint=None):
     storage.assert_target(connection)
@@ -354,8 +404,8 @@ def replay(connection, plan, frame=None, failpoint=None):
         batch = [found[tuple(c)] for c in document["frames"][i]["records"]]
         def seal(c):
             assert_handoff(c,plan)
-            require(ownership(c)==[tuple(x) for x in connection.execute(
-                "SELECT before_ownership FROM hdg_load.cutovers WHERE id=%s",(plan["id"],)).fetchone()[0]],"OWNERSHIP_CHANGED")
+            require(ownership_matches(c,connection.execute(
+                "SELECT before_ownership FROM hdg_load.cutovers WHERE id=%s",(plan["id"],)).fetchone()[0]),"OWNERSHIP_CHANGED")
             c.execute("UPDATE hdg_load.cutovers SET last_data=%s WHERE id=%s",(Jsonb(table_hashes(c)),plan["id"]))
         outcomes.append(engine.apply_frame(connection,document,i,batch,failpoint=failpoint,before_commit=seal,
                                             before_apply=lambda c: begin_frame(c,plan)))
@@ -402,7 +452,7 @@ def rollback(connection, plan, failpoint=None):
         require(row[1]=="ACTIVE","ROLLBACK_STATE")
         assert_handoff(connection,plan,allow_blocked=True)
         require(table_hashes(connection)==row[8],"ROLLBACK_EXTERNAL_WRITES")
-        require(canonical(ownership(connection))==row[5] and table_hashes(connection,row[3])==row[4],"ROLLBACK_EVIDENCE_CHANGED")
+        require(ownership_matches(connection,row[5]) and table_hashes(connection,row[3])==row[4],"ROLLBACK_EVIDENCE_CHANGED")
         for t in TABLES.values():
             connection.execute(sql.SQL("DELETE FROM {}").format(storage.relation(t)))
             connection.execute(sql.SQL("INSERT INTO {} SELECT * FROM {}").format(storage.relation(t),sql.Identifier(row[3],t["mirror"])))
@@ -410,7 +460,7 @@ def rollback(connection, plan, failpoint=None):
         c=row[6]
         connection.execute("UPDATE hdg_load.control SET cdc_enabled=%s,bootstrap_published=%s,last_run_id=%s WHERE id=1",
                            (c["cdc_enabled"],c["bootstrap_published"],c["last_run_id"]))
-        require(table_hashes(connection)==row[4] and canonical(ownership(connection))==row[5],"ROLLBACK_RECONCILE")
+        require(table_hashes(connection)==row[4] and ownership_matches(connection,row[5]),"ROLLBACK_RECONCILE")
         connection.execute("UPDATE hdg_load.cutovers SET state='ROLLED_BACK',last_data=before_data WHERE id=%s",(plan["id"],))
         if failpoint:failpoint("before_commit")
     return "ROLLED_BACK"
@@ -462,7 +512,7 @@ def make_live_plan(connection, run_id, barrier, rehearsal_proof, backup):
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command",choices=["make-plan","prepare","apply","replay","extend","rollback","status"])
+    parser.add_argument("command",choices=["make-plan","prepare","apply","replay","extend","rollback","status","watch"])
     parser.add_argument("--plan",type=Path,required=True)
     parser.add_argument("--extension",type=Path)
     parser.add_argument("--confirm-database",required=True)
@@ -474,6 +524,8 @@ def main():
     parser.add_argument("--rollback-proof",type=Path)
     parser.add_argument("--failure-point")
     parser.add_argument("--crash",action="store_true")
+    parser.add_argument("--interval",type=float,default=5)
+    parser.add_argument("--stop-file",type=Path)
     args=parser.parse_args()
     if args.command=="make-plan":
         require(args.confirm_database=="hdg_mirror" and args.run_id and args.barrier
@@ -487,6 +539,24 @@ def main():
         with args.plan.open("x",encoding="utf-8") as handle:
             handle.write(json.dumps(plan,indent=2))
         print("Live plan verified and written; no publish executed")
+        return
+    if args.command=="watch":
+        # Dùng .env hiện có, không in credential. Plan thực tế được đọc lại từ DB mỗi vòng.
+        import sys
+        sys.path.insert(0,str(Path(__file__).resolve().parents[2]/"jobs"))
+        from c360_full_load import connect
+        from continuous import watch
+        require(args.interval>=1,"WATCH_INTERVAL")
+        plan=json.loads(args.plan.read_text(encoding="utf-8"))
+        purpose=validate_plan(plan)
+        connection=connect()
+        if purpose=="clone":
+            config=connection.info.get_parameters()
+            config.update(dbname=plan["target"]["database"],password=os.environ["PG_PASSWORD"])
+            connection.close()
+            connection=psycopg.connect(**config,autocommit=True)
+        with connection:
+            watch(connection,plan,args.confirm_database,interval=args.interval,stop_file=args.stop_file)
         return
     plan=json.loads(args.plan.read_text(encoding="utf-8"))
     purpose=validate_plan(plan)

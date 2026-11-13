@@ -634,7 +634,7 @@ def guard_cdc_compatibility(conn):
         plan,data,owner=records[0]
         with cutover.target(conn,plan,"hdg_mirror","status"):
             storage.assert_target(conn);cutover.safe_schema(conn);cutover.assert_handoff(conn,plan)
-            if cutover.table_hashes(conn)!=data or canonical(cutover.ownership(conn))!=owner:
+            if cutover.table_hashes(conn)!=data or not cutover.ownership_matches(conn,owner):
                 raise Blocked("NRT_MIRROR_EXTERNAL_CHANGE")
     else:
         with storage.cutover_target(conn,conn.info.dbname,conn.info.dbname,"clone"):

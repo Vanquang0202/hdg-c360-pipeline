@@ -306,5 +306,80 @@ class ProtocolTests(unittest.TestCase):
         connect.assert_not_called()
 
 
+
+class OwnershipAclCloneTests(unittest.TestCase):
+    # Chỉ chạy khi chỉ định clone riêng; mọi thay đổi ACL nằm trong transaction rollback.
+    @unittest.skipUnless(__import__('os').environ.get('HDG_ACL_TEST_DSN'), 'Requires isolated ACL clone')
+    def test_acl_allowlist_and_forbidden_changes(self):
+        import os
+        import psycopg
+        import cutover
+        from psycopg import sql
+        with psycopg.connect(os.environ['HDG_ACL_TEST_DSN'],autocommit=True) as c:
+            self.assertRegex(c.info.dbname,r'^hdg_acl_[0-9a-f]{8}_test$')
+            self.assertEqual(c.info.port,15433)
+            expected=[list(r) for r in cutover.ownership(c)]
+            for r in expected:r[3]=None
+            self.assertTrue(cutover.ownership_matches(c,expected))
+            for row in expected:
+                for statement in [
+                    *['GRANT '+p+' ON public.{} TO hdg_airflow_reader' for p in ('INSERT','UPDATE','DELETE','TRUNCATE','REFERENCES','TRIGGER')],
+                    'GRANT SELECT ON public.{} TO hdg_airflow_reader WITH GRANT OPTION',
+                    'GRANT SELECT ON public.{} TO hdg_acl_outsider',
+                    'ALTER TABLE public.{} OWNER TO hdg_acl_outsider',
+                    'ALTER TABLE public.{} ENABLE ROW LEVEL SECURITY',
+                    'GRANT UPDATE(id) ON public.{} TO hdg_airflow_reader']:
+                    with self.subTest(table=row[0],statement=statement), c.transaction(force_rollback=True):
+                        c.execute(sql.SQL(statement).format(sql.Identifier(row[0])))
+                        self.assertFalse(cutover.ownership_matches(c,expected))
+            for statement in ('GRANT hdg_acl_outsider TO hdg_airflow_reader','ALTER ROLE hdg_airflow_reader CREATEDB'):
+                with self.subTest(statement=statement), c.transaction(force_rollback=True):
+                    c.execute(statement)
+                    self.assertFalse(cutover.ownership_matches(c,expected))
+
+
+class ContinuousAssemblyTests(unittest.TestCase):
+    def test_multi_event_transaction_and_tombstone(self):
+        from continuous import assemble
+        from fixtures import demo
+        b=demo(); doc=b.document()
+        frames=assemble(doc,list(reversed(b.records)))
+        self.assertEqual([f['event_count'] for f in frames],[1,1,1,1])
+        check_records(dict(doc,frames=frames),b.records)
+        b=Builder(); a=image('VSS_DM_DANTOC',id=901,ma='ZX',ten='Test')
+        b.transaction([('VSS_DM_DANTOC','c',None,a),('VSS_DM_DANTOC','u',a,dict(a,ten='Changed'))])
+        self.assertEqual(assemble(b.document(),b.records)[0]['event_count'],2)
+
+    def test_incomplete_transaction_waits_without_frame(self):
+        from continuous import assemble
+        b=Builder();a=image('VSS_DM_QUOC_TICH',id=901,ma='ZX',ten='Test')
+        b.transaction([('VSS_DM_QUOC_TICH','c',None,a)])
+        self.assertIsNone(assemble(b.document(),b.records[:-1]))
+        self.assertIsNone(assemble(b.document(),[b.records[0],b.records[-1]]))
+
+    def test_new_partition_blocks_before_kafka_ack_or_dml(self):
+        import continuous
+        plan={'manifest':{'epoch':'test','frames':[],'streams':[{'topic':'topic'}]}}
+        future=Mock();future.result.return_value=SimpleNamespace(topic_id='id',partitions=[SimpleNamespace(id=0),SimpleNamespace(id=1)])
+        admin=Mock();admin.describe_topics.return_value={'topic':future}
+        consumer=Mock()
+        with patch.object(continuous,'inspect'),patch.object(continuous.cutover,'assert_handoff',return_value=('ACTIVE',0)),patch.object(continuous.cutover,'checkpoints',return_value=[('topic','id',0,5)]),patch.object(continuous.cutover,'replay') as replay:
+            with self.assertRaises(Rejected) as ex:continuous.cycle(Mock(),plan,admin,consumer,'unused')
+            self.assertEqual(ex.exception.code,'WATCH_PARTITION_LAYOUT_CHANGED')
+            consumer.commit.assert_not_called();replay.assert_not_called()
+
+    def test_late_tombstone_has_no_dml(self):
+        from continuous import assemble
+        b=Builder();b.emit(b.prefix+'.VSS.VSS_DM_DBHC',None,None)
+        self.assertEqual(assemble(b.document(),b.records)[0]['event_count'],0)
+
+    def test_schema_source_and_topic_mismatch_block(self):
+        from continuous import assemble
+        b=Builder();a=image('VSS_DM_QUOC_TICH',id=901,ma='ZX',ten='Test')
+        b.transaction([('VSS_DM_QUOC_TICH','c',None,a)])
+        with self.assertRaises(Rejected):assemble(dict(b.document(),topic_prefix='wrong'),b.records)
+        records=list(b.records);records[1]=replace(records[1],value=b'{invalid')
+        with self.assertRaises(Rejected):assemble(b.document(),records)
+
 if __name__=="__main__":
     unittest.main()

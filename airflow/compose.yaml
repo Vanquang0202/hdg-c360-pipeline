@@ -1,0 +1,71 @@
+name: hdg-c360-airflow
+services:
+  metadata2:
+    image: postgres:16
+    container_name: hdg-c360-airflow2-metadata
+    environment:
+      POSTGRES_DB: hdg_airflow2
+      POSTGRES_USER: hdg_airflow
+      POSTGRES_PASSWORD: ${HDG_AIRFLOW_METADATA_PASSWORD:?Set airflow/.env}
+    volumes:
+      - metadata2:/var/lib/postgresql/data
+    mem_limit: 192m
+    command: ["postgres", "-c", "shared_buffers=32MB", "-c", "max_connections=30"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hdg_airflow -d hdg_airflow2"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+  airflow:
+    build: .
+    image: hdg-c360-airflow:2.10.5
+    container_name: hdg-c360-airflow
+    environment:
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__PARALLELISM: "1"
+      AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG: "1"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+      AIRFLOW__CORE__FERNET_KEY: ${HDG_AIRFLOW_FERNET_KEY:?Set airflow/.env}
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://hdg_airflow:${HDG_AIRFLOW_METADATA_PASSWORD:?Set airflow/.env}@metadata2:5432/hdg_airflow2
+      AIRFLOW__WEBSERVER__SECRET_KEY: ${HDG_AIRFLOW_API_SECRET:?Set airflow/.env}
+      AIRFLOW__WEBSERVER__WORKERS: "1"
+      AIRFLOW__WEBSERVER__BASE_URL: http://127.0.0.1:8091
+      AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session
+      AIRFLOW__SCHEDULER__PARSING_PROCESSES: "1"
+      AIRFLOW__SCHEDULER__MIN_FILE_PROCESS_INTERVAL: "60"
+      PG_JDBC_URL: jdbc:postgresql://localhost:15432/hdg_mirror
+      PG_USER: hdg_airflow_reader
+      PG_PASSWORD: ${HDG_AIRFLOW_READER_PASSWORD:?Set airflow/.env}
+      HDG_AIRFLOW_INSTANCE: hdg-c360
+    command: ["bash", "-c", "airflow db migrate && python /opt/airflow/init_local.py && (airflow webserver --port 8080 & airflow scheduler & wait -n)"]
+    ports:
+      - "127.0.0.1:8091:8080"
+    volumes:
+      - logs2:/opt/airflow/logs
+      - ./.env.auth.json:/opt/airflow/auth/passwords.json:ro
+      - ./hdg_pipeline.py:/opt/airflow/dags/hdg_pipeline.py:ro
+      - ../jobs/c360_reconcile.py:/opt/hdg/jobs/c360_reconcile.py:ro
+      - ../jobs/c360_full_load.py:/opt/hdg/jobs/c360_full_load.py:ro
+      - ../jobs/schema_contract.py:/opt/hdg/jobs/schema_contract.py:ro
+      - ../sql/oracle/01_create_source_tables.sql:/opt/hdg/sql/oracle/01_create_source_tables.sql:ro
+      - ../tests/test_airflow.py:/opt/hdg/tests/test_airflow.py:ro
+    depends_on:
+      metadata2:
+        condition: service_healthy
+    mem_limit: 1536m
+    cpus: 1.5
+    restart: unless-stopped
+  mirror-read-proxy:
+    image: alpine/socat@sha256:3d9e7966201dd3a065df591020a09fd3c70845de7e7086e3531ea69db774406b
+    container_name: hdg-c360-airflow-proxy
+    network_mode: service:airflow
+    command: ["TCP4-LISTEN:15432,bind=127.0.0.1,reuseaddr,fork", "TCP4:host.docker.internal:15432"]
+    depends_on:
+      - airflow
+    mem_limit: 32m
+    restart: unless-stopped
+volumes:
+  metadata2:
+  logs2:
