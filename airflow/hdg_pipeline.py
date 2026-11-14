@@ -200,3 +200,72 @@ with DAG(
     serving=PythonOperator(task_id='serving_checks',python_callable=serving_checks)
     complete=PythonOperator(task_id='read_only_complete',python_callable=read_only_complete)
     guard >> preflight >> mirror >> c360 >> reconcile >> feed >> serving >> complete
+
+# DAG ETL hữu hạn riêng; tám task của hdg_pipeline_checks phía trên giữ nguyên.
+def dispatch_etl(step, **context):
+    import json,re,subprocess
+    from pathlib import Path
+    from airflow.hooks.base import BaseHook
+    params=context['params'];run=context['dag_run']
+    if not params.get('allow_clone_write'):
+        raise AirflowFailException('WRITE_NOT_AUTHORIZED: explicitly approve an isolated clone run')
+    if not re.fullmatch(r'hdg_airflow_[0-9a-f]{8}_test',params.get('target_db','')):
+        raise AirflowFailException('LIVE_OR_UNKNOWN_TARGET_BLOCKED')
+    if type(params.get('source_scn')) is not int or params['source_scn']<1:
+        raise AirflowFailException('EXPLICIT_CLONE_SCN_REQUIRED')
+    try:connection=BaseHook.get_connection('hdg_etl_runner')
+    except Exception as error:raise AirflowFailException('ETL_RUNNER_CONNECTION_MISSING') from error
+    extra=connection.extra_dejson
+    if str(run.run_type) not in ('manual','DagRunType.MANUAL') and extra.get('allow_scheduled_clone') is not True:
+        raise AirflowFailException('SCHEDULED_WRITE_NOT_APPROVED')
+    # SSH có sẵn trong image; không mở Docker socket hay thêm service nhận lệnh Windows.
+    host=connection.host or '';user=connection.login or ''
+    if not re.fullmatch(r'[A-Za-z0-9.-]+',host) or not re.fullmatch(r'[A-Za-z0-9_.-]+',user):
+        raise AirflowFailException('ETL_SSH_ENDPOINT_INVALID')
+    paths=[extra.get(k,'') for k in ('identity_file','known_hosts_file')]
+    if not all(Path(p).is_file() and str(Path(p)).startswith('/opt/airflow/') for p in paths):
+        raise AirflowFailException('ETL_SSH_PINNED_KEY_AND_KNOWN_HOSTS_REQUIRED')
+    python=extra.get('python_path','');runner=extra.get('runner_path','')
+    if not all(re.fullmatch(r'[A-Za-z0-9_./:\\-]+',p) for p in (python,runner)) or not runner.replace('\\','/').endswith('/airflow/etl_runner.py'):
+        raise AirflowFailException('ETL_REMOTE_RUNNER_PATH_INVALID')
+    request=dict(step=step,dag_run=run.run_id,**{k:params[k] for k in ('target_db','source_scn','batch_size','allow_clone_write')})
+    command=['/usr/bin/ssh','-T','-o','BatchMode=yes','-o','StrictHostKeyChecking=yes','-o','ConnectTimeout=10','-o','ServerAliveInterval=15','-o','ServerAliveCountMax=3','-o','UserKnownHostsFile='+paths[1],'-i',paths[0],'-p',str(connection.port or 22),user+'@'+host,python+' '+runner]
+    try:completed=subprocess.run(command,input=json.dumps(request),capture_output=True,text=True,timeout=2000)
+    except subprocess.TimeoutExpired as error:raise AirflowException('ETL_TRANSPORT_TIMEOUT: inspect remote state before retry') from error
+    try:result=json.loads(completed.stdout)
+    except ValueError as error:raise AirflowException('ETL_TRANSPORT_FAILED_NO_RESULT: inspect SSH and runner; no success inferred') from error
+    if completed.returncode or result.get('status')=='BLOCKED':
+        reason=result.get('reason','ETL_RUNNER_FAILED')
+        # Chỉ log mã lỗi, không echo stderr/config/credential từ máy runner.
+        if not re.fullmatch(r'[A-Z0-9_]+',reason):reason='ETL_RUNNER_FAILED'
+        raise AirflowException(reason)
+    allowed={'preflight':{'READY'},'spark_stage':{'STAGED'},'reconcile_stage':{'VALIDATED'},
+             'publish_mirror':{'PUBLISHED'},'c360_full':{'SUCCESS','SUCCESS_WITH_UNKNOWN'},
+             'reconcile_final':{'PASS','PASS_WITH_UNKNOWN'}}
+    actual=result.get('previous_result',{}) if result.get('cached') is True else result
+    if result.get('step')!=step or actual.get('status') not in allowed[step]:
+        raise AirflowException('ETL_RESULT_MISSING_OR_WRONG_PHASE')
+    if result.get('cached') and result.get('processed_this_attempt')!=0:
+        raise AirflowException('ETL_CACHED_RESULT_CANNOT_CLAIM_NEW_ROWS')
+    print(json.dumps(result,ensure_ascii=False))
+    return result
+
+
+import os as _etl_os
+with DAG(
+    dag_id='hdg_full_load_pipeline',description='Spark Stage → đối soát → guarded bootstrap clone → C360 Full → đối soát',
+    schedule=_etl_os.environ.get('HDG_FULL_LOAD_CRON','0 2 * * *'),
+    start_date=datetime(2026,1,1,tzinfo=timezone(timedelta(hours=7))),catchup=False,
+    is_paused_upon_creation=True,max_active_runs=1,max_active_tasks=1,
+    dagrun_timeout=timedelta(hours=4),tags=['hdg','etl','clone-only'],
+    params={'allow_clone_write':Param(False,type='boolean'),
+            'target_db':Param('',type='string'),
+            'source_scn':Param(0,type='integer',minimum=0),
+            'batch_size':Param(1000,type='integer',minimum=1,maximum=10000)},
+    default_args={'owner':'hdg','retries':1,'retry_delay':timedelta(minutes=2),
+                  'execution_timeout':timedelta(minutes=35),'do_xcom_push':True},
+) as full_load_dag:
+    _etl_tasks=[PythonOperator(task_id=step,python_callable=dispatch_etl,op_kwargs={'step':step},
+                              retries=0 if step=='preflight' else 1)
+                for step in ('preflight','spark_stage','reconcile_stage','publish_mirror','c360_full','reconcile_final')]
+    for _previous,_next in zip(_etl_tasks,_etl_tasks[1:]):_previous >> _next

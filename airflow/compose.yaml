@@ -51,6 +51,8 @@ services:
       - logs2:/opt/airflow/logs
       - ./.env.auth.json:/opt/airflow/auth/passwords.json:ro
       - ./hdg_pipeline.py:/opt/airflow/dags/hdg_pipeline.py:ro
+      - ./etl_runner.py:/opt/airflow/etl_runner.py:ro
+      - etl_ssh:/opt/airflow/etl-ssh:ro
       - ../jobs/c360_reconcile.py:/opt/hdg/jobs/c360_reconcile.py:ro
       - ../jobs/c360_full_load.py:/opt/hdg/jobs/c360_full_load.py:ro
       - ../jobs/schema_contract.py:/opt/hdg/jobs/schema_contract.py:ro
@@ -83,6 +85,9 @@ services:
 volumes:
   metadata2:
   logs2:
+  etl_ssh:
+    external: true
+    name: hdg-c360-airflow_etl_ssh
 
 networks:
   cdc:

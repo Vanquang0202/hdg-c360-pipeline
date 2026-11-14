@@ -416,18 +416,59 @@ docker compose --env-file airflow/.env -f airflow/compose.yaml up -d --no-build 
 
 Rollback dùng nguyên metadata 3 cũ, không restore dump đè lên metadata 2. Không thay Fernet/auth secret. Hai bộ metadata vẫn độc lập và được giữ lại. Muốn quay lại Airflow 2 sau rollback cần phục hồi bộ cấu hình 2 đã review; không chỉ đổi tag image trên schema metadata khác phiên bản.
 
-### Những job chưa bật qua Airflow
+### DAG ETL `hdg_full_load_pipeline`
 
-| Job hiện có | Phụ thuộc và điều kiện trước khi đưa vào DAG ghi dữ liệu |
-|---|---|
-| `generator/seed.py`, `changes.py` | Thủ công; không tự sinh DML theo lịch. |
-| `jobs/run_spark.ps1` → `full_load.py --stage-only` | Spark/JDBC Windows; Stage theo run mới, đối soát đủ 4 bảng tại cùng SCN trước mọi publish. Chưa có adapter Spark Linux/Windows executor trong Airflow. |
-| `jobs/reconcile.py` | Oracle ↔ Stage/Mirror tại cùng snapshot; job có SHARE lock/audit tùy mode, cần cửa sổ vận hành tránh chặn Sink. Chưa chạy trong lượt này. |
-| `cdc/sink/cutover.py` prepare/apply/extend/replay | Cần plan, fence/barrier còn hiệu lực, backup/rollback và checkpoint handoff đã kiểm chứng; không tự lấy offset, reset epoch hoặc retry apply mù. Chưa cấp quyền/entrypoint ghi cho Airflow. |
-| `jobs/c360_full_load.py full` | Khóa Control và phối hợp NRT/cutover theo guard hiện có. Chỉ bật sau diễn tập quyền ghi/retry/timeout/cancellation trên DB test. |
-| `jobs/c360_full_load.py worker` | Tài liệu yêu cầu mỗi phút; watcher hiện có được giữ nguyên. Chỉ chuyển sang cron mỗi phút sau khi dừng watcher có kiểm soát và kiểm chứng single-worker/ACK/rollback; không chạy thêm worker song song. |
+DAG riêng tại <http://127.0.0.1:8091/dags/hdg_full_load_pipeline/grid> gọi job thật, không đổi tám task của `hdg_pipeline_checks`:
 
-Nhánh ghi dữ liệu hiện BLOCKED trong Airflow. Đây là giới hạn triển khai, không phải các entrypoint Full Load/CDC/C360 cũ bị lỗi. Trước khi bật lịch thật cần chốt tần suất, runner Spark, cơ chế loại trừ writer ngoài Airflow và diễn tập rerun/cancellation với guard hiện có. Chỉ unpause DAG kiểm tra không bật được những job ghi này. Không coi `max_active_runs=1` là bảo vệ checkpoint giữa Airflow và lệnh chạy tay.
+`preflight → spark_stage → reconcile_stage → publish_mirror → c360_full → reconcile_final`
+
+- `preflight`: xác nhận phê duyệt clone, PDB Oracle test, database comment/endpoint/schema; chặn writer khác bằng advisory lock và kiểm CDC/Watcher/Control. Không nhận `hdg_mirror` làm đích.
+- `spark_stage`: gọi `full_load.py --stage-only --source-scn ... --batch-size ...`; lấy đúng run_id từ log hoàn thành và số đọc/ghi từ bốn audit của run.
+- `reconcile_stage`: gọi `reconcile.py --target stage --source snapshot --record-stage-audit`; phải khớp đủ 132 cột, số lần lặp và SHA256 trước publish.
+- `publish_mirror`: gọi nguyên `hdg_load.publish_full_load(run_id)` trong transaction. Chỉ bootstrap clone rỗng; không tự thay Mirror khác baseline hoặc gọi cutover live.
+- `c360_full`: gọi `c360_full_load.full_load(connection_clone)`, giữ nguyên lọc/khử trùng/chuẩn hóa/DQ và staging/publish. Không nới CLI C360 live.
+- `reconcile_final`: Spark so Oracle snapshot với Mirror clone rồi gọi `c360_reconcile.reconcile(connection_clone)`; sai khác làm task fail.
+
+Lịch kỹ thuật đề xuất: `0 2 * * *`, timezone UTC+7; đổi bằng `HDG_FULL_LOAD_CRON` trong môi trường Airflow. Tài liệu chưa chốt lịch vận hành. DAG mặc định paused, `catchup=False`, một run/task đồng thời. `allow_clone_write=False` mặc định; scheduled run còn cần `allow_scheduled_clone=true` trong connection. Unpause một mình không cấp quyền ghi. Hiện chỉ hỗ trợ bootstrap clone mới, không dùng cron này để refresh Mirror đang có CDC.
+
+Task có timeout 35 phút, retry một lần sau hai phút; preflight không retry. Runner giới hạn mỗi Spark subprocess 30 phút và dừng cây tiến trình khi timeout. Log riêng từng lần chạy ở `test-results/airflow-etl/<run-hash>/` trên runner; Airflow chỉ nhận JSON tổng hợp, không nhận credential hoặc raw row. Số bản ghi publish lấy từ audit Stage đúng run, không dùng tổng dữ liệu live làm số đã xử lý. Kết quả dùng lại có `cached=true`, `processed_this_attempt=0`. Nếu Spark/C360 đã bắt đầu nhưng chưa có kết quả chắc chắn, hoặc publish đã commit nhưng mất phản hồi, retry fail-closed để kiểm tra thủ công; không reset trạng thái run hoặc xóa Stage.
+
+**Runner:** image Airflow hiện không có Java/PySpark. DAG dùng OpenSSH client có sẵn để gọi hữu hạn `airflow/etl_runner.py` trên máy runner có Spark. Trên Windows, runner nạp đủ biến môi trường clone từ `.env.etl` rồi gọi lại launcher đã có. Các lệnh dưới đây minh họa lệnh do runner sinh; không chạy trực tiếp trong shell đang dùng `jobs/.env` live:
+
+```powershell
+& E:/Projects/hdg-c360-pipeline/jobs/run_spark.ps1 -Job full_load -Python C:/Python311/python.exe -JobArguments @('--stage-only','--source-scn','<SCN_PDB_TEST>','--batch-size','1000')
+& E:/Projects/hdg-c360-pipeline/jobs/run_spark.ps1 -Job reconcile -Python C:/Python311/python.exe -JobArguments @('--run-id','<run_id>','--target','stage','--source','snapshot','--record-stage-audit')
+```
+
+Launcher dùng Spark 4.0.1, Java 21, `local[2]`, driver heap 1 GiB, `--driver-class-path` cùng `spark.executor.extraClassPath` cho hai JDBC JAR. Linux runner gọi `spark-submit` với cùng classpath/local[2] và job Python, không chạy Spark trong webserver Airflow. Runner cần PySpark 4.0.1, python-dotenv, oracledb (chỉ SELECT identity), psycopg 3.3.8; mọi copy Oracle→Stage vẫn qua Spark JDBC.
+
+**Thiết lập trước khi chạy thật trên clone:**
+
+1. Chuẩn bị Oracle PDB test độc lập có tên `HDG_ETL_<8 ký tự HEX hoa>`, schema VSS và bốn bảng đúng DDL. Không trỏ vào FREEPDB1 hiện tại. Chốt SCN của PDB test, không lấy SCN từ Mirror live.
+2. Tạo PostgreSQL test mới tên `hdg_airflow_<8 hex thường>_test`; cài `01_create_mirror_tables.sql`, `02_publish_full_load.sql`, `05_c360.sql` vào đúng database mới. Đặt database comment `HDG_AIRFLOW_ETL_CLONE_V1` bằng quy trình quản trị trên clone. Không copy epoch/checkpoint hoặc trigger live vào clone bootstrap này.
+3. Trên runner tạo `airflow/.env.etl` (Git ignore), có đủ `PG_JDBC_URL`, `PG_USER`, `PG_PASSWORD`, `ORACLE_JDBC_URL`, `ORACLE_USER=VSS`, `ORACLE_PASSWORD`, `ORACLE_TEST_PDB`. URL PostgreSQL chỉ localhost:15432/15433 và đúng tên clone; URL Oracle kết thúc bằng tên PDB test đã khai báo. Không dùng file `jobs/.env` live làm cấu hình ETL này.
+4. SSH key đã được đăng ký cho user Windows `admin`; public host key đọc trực tiếp từ Windows qua helper UAC, đối chiếu key qua mạng rồi pin known_hosts. Private key/known_hosts local ở `airflow/.env.etl_ssh/` (Git ignore). Runtime dùng external volume `hdg-c360-airflow_etl_ssh` mount read-only tại `/opt/airflow/etl-ssh/`, owner 50000, directory 0700/key 0600 để không phụ thuộc NTFS permissions. Không tự trust key lấy từ mạng. Volume key đã được import trước khi recreate riêng Airflow/proxy; metadata/logs2 giữ nguyên. Không xóa volume này khi dọn test. Nếu chuyển máy, import key vào volume với đúng quyền rồi xác minh lại host key trước khi start.
+5. Trong Admin → Connections tạo **Generic** connection `hdg_etl_runner`: Host `host.docker.internal` (runner Windows local), Login là tài khoản runner, Port 22. Extra gồm `identity_file`, `known_hosts_file`, `python_path`, `runner_path`, `allow_scheduled_clone=false`. Ví dụ path: `/opt/airflow/etl-ssh/id_ed25519`, `/opt/airflow/etl-ssh/known_hosts`, `C:/Python311/python.exe`, `E:/Projects/hdg-c360-pipeline/airflow/etl_runner.py`. Password để trống; không đưa key hoặc password vào Extra/README.
+6. Sau khi xác minh runner/clone, trigger thủ công với `allow_clone_write=true`, đúng `target_db`, `source_scn`, `batch_size`. Unpause tạm để scheduler xử lý rồi pause lại. Không gửi shell command hoặc secret trong DAG conf.
+
+**E2E thực tế 14/11 đã PASS:** run `manual__etl_real_bcdaddc7` đủ 6/6 task SUCCESS, đều ở attempt 1, không dùng kết quả cache. Airflow 2.10.5 gọi Windows Spark 4.0.1 qua connection `hdg_etl_runner`, SSH publickey-only và StrictHostKeyChecking. Nguồn là PDB `HDG_ETL_94E22BB2` (cùng Oracle container, tách khỏi FREEPDB1), SCN `7207171`; đích là `hdg_airflow_94e22bb2_test`, không có sink epoch hoặc CDC.
+
+| Task | Thời gian Airflow | Kết quả thật |
+|---|---:|---|
+| preflight | 2.58s | Clone/PDB/driver/guard READY |
+| spark_stage | 104.71s | Oracle→Stage: 1.000 nhân khẩu, 3 dân tộc, 2 quốc tịch, 8 địa bàn; tổng 1.013 dòng |
+| reconcile_stage | 78.38s | Đủ bốn bảng/132 cột, content_equal và SHA256 PASS |
+| publish_mirror | 7.03s | Publisher COMMITTED, chép 1.013 dòng vào Mirror clone |
+| c360_full | 5.22s | 975 dòng hợp lệ → 972 công dân, SUCCESS_WITH_UNKNOWN |
+| reconcile_final | 88.10s | Oracle snapshot↔Mirror đủ bốn bảng; Mirror↔C360 PASS_WITH_UNKNOWN, mọi sai khác bằng 0 |
+
+Full Load run `4bf022ee-6747-4f62-b473-70f1a71d5555`; C360 run `d5077c36-0f48-4886-95f7-bd21cb82188c`. Thời gian trên gồm overhead task/SSH; log Spark còn ghi riêng thời gian từng bảng. Nguồn được seed mới bằng generator hiện có, không lấy tổng dòng live làm số đã xử lý. PDB test ban đầu RESTRICTED do common user cần tablespace USERS; chỉ bổ sung tablespace còn thiếu trong PDB test và reopen PDB test, không cấp RESTRICTED SESSION hay sửa FREEPDB1.
+
+Regression 20/20 PASS sau run; kiểm tra cả sáu task log có SUCCESS/exit 0. Bằng chứng `test-results/airflow-etl/20261114/summary.json`, `dag-result.json`, log từng task và `test-results/airflow-etl/b42536a3ab8f288d27f657fa/` (Git ignore). Private `.env.etl` hiện trỏ clone đã PASS; không rerun để ghi đè clone này. Lượt tiếp theo cần clone rỗng mới và SCN/config được kiểm chứng lại. DAG đã paused lại, không bật lịch ghi tự động.
+
+Live vẫn 50.000 Mirror / 48.747 C360, Queue/quarantine 0; hash bốn Mirror, epoch và năm checkpoint giữ nguyên. Watcher vẫn có lock. Sau đó đã khôi phục Debezium/Sink ngày 14/11: task từng FAILED ORA-01435 lúc 16:28:07 UTC+7 trong khi PDB test chưa đồng bộ common user C##HDG_CDC vì thiếu USERS tablespace. Vi phạm đã RESOLVED; đọc lại cùng query và SCN lỗi trên phiên LogMiner riêng PASS trước khi restart duy nhất task 0. Source tiếp tục từ offset cũ, snapshot SKIPPED, config không đổi; Sink đã qua guard và chạy IDLE bằng plan ACTIVE cũ. Không reset offsets/checkpoint/epoch, không replay bỏ qua SCN. Bằng chứng `test-results/cdc-recovery-20261114/summary.json`, `mining-probe.json`, `connect-redacted.log`. Không xác nhận đây là lỗi vendor đã có mã bug: Oracle không nêu user ID trong ORA-01435; kết luận metadata/common-user sync dựa trên timeline và PDB violation. PDB test cùng CDB không cô lập metadata LogMiner; với các lần thử DDL tạo PDB mới nên dùng Oracle CDB/container test riêng để tránh ảnh hưởng capture của live.
+
+Cutover Mirror đang có CDC vẫn là thao tác riêng qua `cdc/sink/cutover.py`, cần fence/barrier mới, backup/rollback và checkpoint handoff. DAG này không reset connector/offset/epoch, không start/stop continuous Sink hoặc Watcher và chưa được phép điều phối cutover live. Seed và NRT vô hạn cũng không đưa vào PythonOperator.
 
 Bằng chứng Airflow 2 hiện tại nằm trong `test-results/topic-identity/airflow/`: manual run `manual__hdg_pipeline_bc899557` SUCCESS 8/8, log từng task có exit code 0, reconciliation PASS_WITH_UNKNOWN, API và 10 chart-data PASS. DAG đã paused lại. Không chạy Full Load/cutover trong bài thử này.
 
@@ -454,3 +495,5 @@ Windows hiện cần Docker CLI và container Kafka `hdg-cdc-kafka-1` để lấ
 Khi service dừng: kiểm tra đúng task đỏ/log tại <http://127.0.0.1:8091/dags/hdg_pipeline_checks/grid>, sửa nguyên nhân rồi start lại worker theo phần CDC/C360; không reset Connector/epoch/offset. Khi lag: xem checkpoint so goal trong XCom, để sensor retry hữu hạn; timeout vẫn fail. Khi reconciliation sai/quarantine: dừng nghiệm thu, giữ bằng chứng, không publish/cutover để che sai khác. Full Load/cutover vẫn là thao tác riêng có fence/backup; không tự chạy từ DAG này.
 
 Kết quả E2E local sau sửa UUID: 3 DML Oracle mới (commit SCN 6112124 / 6113011 / 6114196), Kafka nhân khẩu [24,28), transaction [36,42); ba topic danh mục vẫn offset 16. PostgreSQL checkpoint bằng Kafka consumer committed offset; inbox/frame/transaction/event ledger đã đối chiếu fingerprint. Mirror trở lại 50.000, C360 48.747, Queue/quarantine 0; hash cả bốn Mirror bằng baseline trước fixture và đối soát C360 không sai khác. Đây là bằng chứng demo local, chưa chứng minh tải/độ trễ production hay exactly-once phía client. Việc lấy UUID bằng CLI Windows tăng chi phí mỗi batch; chưa benchmark tải lớn.
+
+Khôi phục continuous Sink sau incident 14/11 dùng plan xuất nguyên trạng từ ACTIVE tại `test-results/cdc-recovery-20261114/live-plan.json`. Log/PID mới ở cùng thư mục; stop-file vẫn là `test-results/continuous-20261113/stop.request`, không đổi lệnh stop an toàn hiện có. Chỉ start lại sau khi Connector và tất cả task RUNNING ổn định, đủ redo từ persisted SCN và preflight schema/ACL/epoch/topic identity/checkpoint PASS. Không xem TCP/container RUNNING là task khỏe.
