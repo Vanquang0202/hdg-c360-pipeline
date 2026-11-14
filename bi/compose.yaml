@@ -1,0 +1,50 @@
+name: hdg-c360-bi
+services:
+  metadata:
+    image: postgres:16
+    container_name: hdg-c360-bi-metadata
+    environment:
+      POSTGRES_DB: hdg_superset
+      POSTGRES_USER: hdg_superset
+      POSTGRES_PASSWORD: ${HDG_METADATA_PASSWORD:?Set bi/.env}
+    volumes:
+      - metadata:/var/lib/postgresql/data
+    mem_limit: 192m
+    command: ["postgres", "-c", "shared_buffers=32MB", "-c", "max_connections=20"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hdg_superset -d hdg_superset"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+  superset:
+    build: .
+    image: hdg-c360-superset:6.1.0
+    container_name: hdg-c360-superset
+    ports:
+      - "127.0.0.1:8089:8088"
+    environment:
+      SUPERSET_CONFIG_PATH: /app/hdg_superset_config.py
+      HDG_BI_INSTANCE: hdg-c360
+      HDG_SUPERSET_SECRET_KEY: ${HDG_SUPERSET_SECRET_KEY:?Set bi/.env}
+      HDG_METADATA_PASSWORD: ${HDG_METADATA_PASSWORD:?Set bi/.env}
+      HDG_ADMIN_USERNAME: ${HDG_ADMIN_USERNAME:-hdg_admin}
+    volumes:
+      - ./superset_config.py:/app/hdg_superset_config.py:ro
+      - home:/app/superset_home
+    depends_on:
+      metadata:
+        condition: service_healthy
+    command: ["gunicorn", "--bind", "0.0.0.0:8088", "--workers", "1", "--threads", "4", "--timeout", "120", "superset.app:create_app()"]
+    mem_limit: 1024m
+    cpus: 1.0
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8088/health', timeout=5)"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 90s
+    restart: unless-stopped
+volumes:
+  metadata:
+  home:
